@@ -515,7 +515,9 @@ def load_config():
     data.setdefault('app_state',{})
     data.setdefault('fuel_prices',{})
     data.setdefault('market_prices',{})
-    data.setdefault('update_feed_url','')
+   data.setdefault('update_feed_url','https://github.com/jamesronaldthorn-cpu/New-Eden-Command/releases/latest/download/latest.json')
+if not str(data.get('update_feed_url','')).strip():
+    data['update_feed_url']='https://github.com/jamesronaldthorn-cpu/New-Eden-Command/releases/latest/download/latest.json'
     data.setdefault('last_update_check_utc','')
     data.setdefault('live_jump_restrictions',{})
     data.setdefault('favorite_systems',[])
@@ -2760,7 +2762,7 @@ class App(tk.Tk):
         ttk.Label(updates,text='Use a signed-by-hash .ejpupdate package locally, or configure an HTTPS update feed so the app can check and download new releases itself. Every downloaded package is checked against the feed SHA-256 and then its internal manifest SHA-256 values before installation. User data remains outside the install folder.',wraplength=920).pack(anchor='w',pady=(0,14))
 
         online=ttk.LabelFrame(updates,text='Online update feed',padding=12); online.pack(fill='x'); online.columnconfigure(0,weight=1)
-        ttk.Label(online,text='Feed URL (for GitHub Releases: https://github.com/OWNER/REPO/releases/latest/download/latest.json)').grid(row=0,column=0,columnspan=4,sticky='w')
+        ttk.Label(online,text='Feed URL (for GitHub Releases: https://github.com/jamesronaldthorn-cpu/New-Eden-Command/releases/latest/download/latest.json)').grid(row=0,column=0,columnspan=4,sticky='w')
         ttk.Entry(online,textvariable=self.update_feed_url).grid(row=1,column=0,sticky='ew',pady=(6,0))
         ttk.Button(online,text='Save',command=self.save_update_feed).grid(row=1,column=1,padx=(8,4),pady=(6,0))
         self.online_check_btn=ttk.Button(online,text='Check online',command=lambda:self.check_online_update(manual=True)); self.online_check_btn.grid(row=1,column=2,padx=4,pady=(6,0))
