@@ -515,9 +515,9 @@ def load_config():
     data.setdefault('app_state',{})
     data.setdefault('fuel_prices',{})
     data.setdefault('market_prices',{})
-   data.setdefault('update_feed_url','https://github.com/jamesronaldthorn-cpu/New-Eden-Command/releases/latest/download/latest.json')
-if not str(data.get('update_feed_url','')).strip():
-    data['update_feed_url']='https://github.com/jamesronaldthorn-cpu/New-Eden-Command/releases/latest/download/latest.json'
+    data.setdefault('update_feed_url','https://github.com/jamesronaldthorn-cpu/New-Eden-Command/releases/latest/download/latest.json')
+    if not str(data.get('update_feed_url','')).strip():
+        data['update_feed_url']='https://github.com/jamesronaldthorn-cpu/New-Eden-Command/releases/latest/download/latest.json'
     data.setdefault('last_update_check_utc','')
     data.setdefault('live_jump_restrictions',{})
     data.setdefault('favorite_systems',[])
