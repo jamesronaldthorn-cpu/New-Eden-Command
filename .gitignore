@@ -1,0 +1,7 @@
+.buildenv/
+build/
+dist/
+releases/
+developer_settings.local.json
+__pycache__/
+*.pyc

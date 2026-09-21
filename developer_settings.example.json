@@ -1,0 +1,4 @@
+{
+  "eve_sso_client_id": "PASTE_YOUR_CCP_APPLICATION_CLIENT_ID_HERE",
+  "eve_sso_redirect_uri": "http://127.0.0.1:8765/callback"
+}
