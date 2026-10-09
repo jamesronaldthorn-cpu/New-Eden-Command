@@ -1,4 +1,4 @@
-import json, math, sqlite3, threading, urllib.request, urllib.parse, urllib.error, zipfile, tempfile, os, time, sys, subprocess, shutil, csv, base64, hashlib, secrets, webbrowser, http.server, concurrent.futures
+import json, math, sqlite3, threading, urllib.request, urllib.parse, urllib.error, zipfile, tempfile, os, time, sys, subprocess, shutil, csv, base64, hashlib, secrets, webbrowser, http.server, concurrent.futures, gzip
 from datetime import datetime, timezone, timedelta
 from collections import deque
 from pathlib import Path
@@ -15,8 +15,8 @@ if os.name=='nt':
         except Exception: pass
 
 APP_NAME='New Eden Command'
-VERSION='3.4.6'
-SDE_SCHEMA_VERSION=8
+VERSION='3.5.1'
+SDE_SCHEMA_VERSION=9
 APP_ID='eve-jump-planner'
 UPDATE_FORMAT=2
 UPDATE_EXTENSION='.ejpupdate'
@@ -24,7 +24,7 @@ APP_EXECUTABLE_NAME='EVE Jump Planner.exe'
 LY_METERS=9.46e15
 BASE=Path.home()/'.eve_jump_planner'
 DATA=BASE/'data'; DATA.mkdir(parents=True, exist_ok=True)
-DB=DATA/'eve.db'; META=DATA/'meta.json'; CONFIG=BASE/'config.json'; ASSET_PRICE_CACHE=DATA/'asset_market_prices.json'; APP_DIR=Path(__file__).resolve().parent; BACKUPS=BASE/'backups'; DOWNLOADS=BASE/'downloads'
+DB=DATA/'eve.db'; META=DATA/'meta.json'; CONFIG=BASE/'config.json'; ASSET_PRICE_CACHE=DATA/'asset_market_prices.json'; HUNT_HISTORY_FILE=DATA/'hunting_activity_history.json'; ZKILL_CACHE_FILE=DATA/'hunting_zkill_cache.json'; APP_DIR=Path(__file__).resolve().parent; BACKUPS=BASE/'backups'; DOWNLOADS=BASE/'downloads'
 LATEST='https://developers.eveonline.com/static-data/tranquility/latest.jsonl'
 SDE_URL='https://developers.eveonline.com/static-data/tranquility/eve-online-static-data-{build}-jsonl.zip'
 ESI_BASE='https://esi.evetech.net'
@@ -526,6 +526,10 @@ def load_config():
     data.setdefault('active_operation','')
     data.setdefault('activity_cache',{})
     data.setdefault('companion_cache',{})
+    data.setdefault('hunting_cache',{})
+    data.setdefault('ess_observations',{})
+    data.setdefault('hunt_manual_intel',{})
+    data.setdefault('hunt_visit_history',{})
     data.setdefault('esi_name_cache',{})
     data.setdefault('notification_settings',{'industry_hours':2,'skillqueue_hours':24,'activity_score':75})
     sso=data.setdefault('esi_sso',{})
@@ -774,6 +778,42 @@ def resolve_station_info(station_id):
         'type_id':int(data.get('type_id') or 0),
     }
 
+SYSTEM_INFO_RUNTIME_CACHE={}
+CONSTELLATION_REGION_RUNTIME_CACHE={}
+REGION_NAME_RUNTIME_CACHE={}
+
+def resolve_system_info(system_id):
+    """Resolve a solar system missing from the local display index via public ESI."""
+    try:sid=int(system_id or 0)
+    except Exception:return None
+    if not sid:return None
+    if sid in SYSTEM_INFO_RUNTIME_CACHE:return dict(SYSTEM_INFO_RUNTIME_CACHE[sid])
+    try:data,_=esi_get_json(f'/latest/universe/systems/{sid}/',None,client_name='SystemNameResolver')
+    except Exception:return None
+    if not isinstance(data,dict) or not data.get('name'):return None
+    try:const_id=int(data.get('constellation_id') or 0)
+    except Exception:const_id=0
+    region_id=0; region_name='Unknown region'
+    if const_id:
+        region_id=int(CONSTELLATION_REGION_RUNTIME_CACHE.get(const_id,0) or 0)
+        if not region_id:
+            try:
+                cdata,_=esi_get_json(f'/latest/universe/constellations/{const_id}/',None,client_name='SystemNameResolver')
+                region_id=int((cdata or {}).get('region_id') or 0)
+                if region_id:CONSTELLATION_REGION_RUNTIME_CACHE[const_id]=region_id
+            except Exception:region_id=0
+    if region_id:
+        region_name=str(REGION_NAME_RUNTIME_CACHE.get(region_id) or '')
+        if not region_name:
+            try:
+                rdata,_=esi_get_json(f'/latest/universe/regions/{region_id}/',None,client_name='SystemNameResolver')
+                region_name=str((rdata or {}).get('name') or '').strip() or 'Unknown region'
+                REGION_NAME_RUNTIME_CACHE[region_id]=region_name
+            except Exception:region_name='Unknown region'
+    rec={'name':str(data.get('name')).strip(),'category':'solar_system','system_id':sid,'constellation_id':const_id,'region_id':region_id,'region_name':region_name,'security':float(data.get('security_status',0) or 0),'position':data.get('position') or {}}
+    SYSTEM_INFO_RUNTIME_CACHE[sid]=dict(rec)
+    return rec
+
 def asset_flag_is_fitted(flag):
     """Return True for inventory flags representing modules fitted to a ship.
 
@@ -1012,6 +1052,7 @@ def database_schema_ready():
         c=sqlite3.connect(DB)
         has_regions=bool(c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='regions'").fetchone())
         has_types=bool(c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='types'").fetchone())
+        has_universe_systems=bool(c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='universe_systems'").fetchone())
         has_stations=bool(c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='stations'").fetchone())
         has_stargates=bool(c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='stargates'").fetchone())
         has_skill_requirements=bool(c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='skill_requirements'").fetchone())
@@ -1029,8 +1070,11 @@ def database_schema_ready():
         # and the existence of the type table rather than three hard-coded
         # probe IDs.  This prevents a transient/partial SDE type export from
         # forcing an endless rebuild loop at 98%.
-        names_ok=type_count>0
-        return has_regions and has_types and has_stations and has_stargates and has_skill_requirements and has_skill_meta and names_ok and 'station_count' in cols and int(load_meta().get('schema_version',0) or 0)>=SDE_SCHEMA_VERSION
+        # A nearly-empty type table is not a healthy name index.  Older builds
+        # accepted a three-row emergency seed as "ready", which allowed thousands
+        # of assets/ships/skills to keep displaying unresolved names indefinitely.
+        names_ok=type_count>=10000
+        return has_regions and has_types and has_universe_systems and has_stations and has_stargates and has_skill_requirements and has_skill_meta and names_ok and 'station_count' in cols and int(load_meta().get('schema_version',0) or 0)>=SDE_SCHEMA_VERSION
     except Exception:
         return False
 
@@ -1067,6 +1111,13 @@ def update_sde(progress=lambda message,percent=None:None):
     con=sqlite3.connect(newdb); cur=con.cursor()
     cur.execute('CREATE TABLE systems(id INTEGER PRIMARY KEY,name TEXT COLLATE NOCASE,x REAL,y REAL,z REAL,security REAL,region_id INTEGER,constellation_id INTEGER,station_count INTEGER NOT NULL DEFAULT 0)')
     cur.execute('CREATE INDEX ix_system_name ON systems(name)')
+    # Keep a complete system-name index separate from the capital-navigation
+    # universe.  Current CCP SDE system IDs extend beyond the historical
+    # 30,000,001-30,999,999 range (wormholes/special/new space included).  Those
+    # systems must still have readable names in assets, clones, contracts and
+    # character telemetry without accidentally making them valid cyno targets.
+    cur.execute('CREATE TABLE universe_systems(id INTEGER PRIMARY KEY,name TEXT COLLATE NOCASE,x REAL,y REAL,z REAL,security REAL,region_id INTEGER,constellation_id INTEGER,station_count INTEGER NOT NULL DEFAULT 0)')
+    cur.execute('CREATE INDEX ix_universe_system_name ON universe_systems(name)')
     cur.execute('CREATE TABLE regions(id INTEGER PRIMARY KEY,name TEXT COLLATE NOCASE)')
     cur.execute('CREATE TABLE types(id INTEGER PRIMARY KEY,name TEXT COLLATE NOCASE,group_id INTEGER,market_group_id INTEGER,volume REAL,published INTEGER)')
     cur.execute('CREATE INDEX ix_type_name ON types(name)')
@@ -1174,23 +1225,33 @@ def update_sde(progress=lambda message,percent=None:None):
         member=locate_member(z,'mapSolarSystems.jsonl')
         member_size=max(1,z.getinfo(member).file_size)
         progress('Importing solar systems…', 72)
+        universe_count=0
         with z.open(member) as fh:
-            rows=[]; processed=0
+            route_rows=[]; all_rows=[]; processed=0
             for raw in fh:
                 processed+=len(raw)
                 s=json.loads(raw)
                 sid=int(s.get('_key',s.get('solarSystemID',0)))
+                if not sid: continue
+                p=s.get('position') or {}
+                name=s.get('name')
+                if isinstance(name,dict): name=name.get('en') or name.get('en-us') or name.get('en_US') or next((v for v in name.values() if v),str(sid))
+                rec=(sid,str(name or sid),p.get('x',0),p.get('y',0),p.get('z',0),s.get('securityStatus',0),s.get('regionID'),s.get('constellationID'),0)
+                all_rows.append(rec); universe_count+=1
+                # Preserve the established capital-navigation universe.  The
+                # complete universe_systems table above is display/name data;
+                # only these legacy K-space IDs participate in jump/range logic.
                 if 30000000 <= sid <= 30999999:
-                    p=s.get('position') or {}
-                    name=s.get('name')
-                    if isinstance(name,dict): name=name.get('en') or name.get('en-us') or next(iter(name.values()),str(sid))
-                    rows.append((sid,str(name),p.get('x',0),p.get('y',0),p.get('z',0),s.get('securityStatus',0),s.get('regionID'),s.get('constellationID'),0))
-                    if len(rows)>=1000:
-                        cur.executemany('INSERT INTO systems VALUES(?,?,?,?,?,?,?,?,?)',rows); count+=len(rows); rows=[]
-                if count % 1000 == 0:
+                    route_rows.append(rec); count+=1
+                if len(all_rows)>=1000:
+                    cur.executemany('INSERT OR REPLACE INTO universe_systems VALUES(?,?,?,?,?,?,?,?,?)',all_rows); all_rows=[]
+                if len(route_rows)>=1000:
+                    cur.executemany('INSERT OR REPLACE INTO systems VALUES(?,?,?,?,?,?,?,?,?)',route_rows); route_rows=[]
+                if universe_count % 1000 == 0:
                     pct=72 + min(1.0,processed/member_size)*25
-                    progress(f'Importing solar systems… {count:,} loaded', pct)
-            if rows: cur.executemany('INSERT INTO systems VALUES(?,?,?,?,?,?,?,?,?)',rows); count+=len(rows)
+                    progress(f'Importing solar systems… {universe_count:,} names indexed • {count:,} navigation systems', pct)
+            if all_rows: cur.executemany('INSERT OR REPLACE INTO universe_systems VALUES(?,?,?,?,?,?,?,?,?)',all_rows)
+            if route_rows: cur.executemany('INSERT OR REPLACE INTO systems VALUES(?,?,?,?,?,?,?,?,?)',route_rows)
 
         # Stargate graph powers the Hunting / Roam Intelligence scanner.
         progress('Indexing stargate connections…', 96)
@@ -1237,7 +1298,9 @@ def update_sde(progress=lambda message,percent=None:None):
                     if len(station_rows)>=1500:
                         cur.executemany('INSERT OR REPLACE INTO stations VALUES(?,?,?,?,?,?,?,?)',station_rows); station_rows=[]
                 if station_rows: cur.executemany('INSERT OR REPLACE INTO stations VALUES(?,?,?,?,?,?,?,?)',station_rows)
-            cur.executemany('UPDATE systems SET station_count=? WHERE id=?',[(n,sid) for sid,n in station_counts.items()])
+            counts=[(n,sid) for sid,n in station_counts.items()]
+            cur.executemany('UPDATE systems SET station_count=? WHERE id=?',counts)
+            cur.executemany('UPDATE universe_systems SET station_count=? WHERE id=?',counts)
         except Exception:
             station_total=0
 
@@ -1271,12 +1334,16 @@ def update_sde(progress=lambda message,percent=None:None):
             if not probes.get(tid):
                 cur.execute('INSERT OR IGNORE INTO types(id,name,group_id,market_group_id,volume,published) VALUES(?,?,?,?,?,?)',(tid,name,None,None,None,1))
         con.commit(); type_total=int(cur.execute('SELECT COUNT(*) FROM types').fetchone()[0])
+        if type_total < 10000:
+            detail=str(locals().get('type_import_error','') or '').strip()
+            raise RuntimeError('CCP item/type name index is incomplete '
+                               f'({type_total:,} names imported). The existing EVE database was not replaced.'+
+                               (f' Import error: {detail}' if detail else ''))
     finally:
         con.close()
     os.replace(newdb,DB); os.unlink(tmp)
-    meta['sde_build']=build; meta['schema_version']=SDE_SCHEMA_VERSION; meta['system_count']=count; meta['npc_station_count']=locals().get('station_total',0); meta['stargate_connection_count']=len(locals().get('gate_pairs',set())); meta['type_name_count']=type_total; meta['type_name_health']='full' if type_total>=10000 else 'repair-on-demand'; meta['type_import_error']=locals().get('type_import_error',''); save_meta(meta)
-    suffix='' if type_total>=10000 else ' • type names will self-repair from CCP ESI as needed'
-    progress(f'Imported {count:,} systems, {int(locals().get("station_total",0)):,} NPC stations, {len(locals().get("gate_pairs",set())):,} stargate links and {type_total:,} type names{suffix}. EVE data is ready.', 100)
+    meta['sde_build']=build; meta['schema_version']=SDE_SCHEMA_VERSION; meta['system_count']=count; meta['universe_system_count']=locals().get('universe_count',count); meta['npc_station_count']=locals().get('station_total',0); meta['stargate_connection_count']=len(locals().get('gate_pairs',set())); meta['type_name_count']=type_total; meta['type_name_health']='full'; meta['type_import_error']=''; save_meta(meta)
+    progress(f'Imported {count:,} navigation systems, {int(locals().get("universe_count",count)):,} system names, {int(locals().get("station_total",0)):,} NPC stations, {len(locals().get("gate_pairs",set())):,} stargate links and {type_total:,} item/type names. EVE data is ready.', 100)
     return build,True
 
 
@@ -1304,6 +1371,38 @@ def suggestions(prefix,limit=12):
 
 TYPE_NAME_RUNTIME_CACHE={}
 
+def _bulk_local_type_names(type_ids):
+    """Prime/read many type names with a handful of SQLite queries.
+
+    Asset inventories can contain thousands of stacks.  The old resolver opened
+    SQLite once per unique type, which was both slow and made the UI appear to
+    hang while still leaving uncached rows unresolved.  This bulk path makes
+    name lookup effectively constant-cost for a rendered snapshot.
+    """
+    clean=[]; seen=set(); out={}
+    for value in type_ids or []:
+        try:tid=int(value or 0)
+        except Exception:continue
+        if tid<=0 or tid in seen:continue
+        seen.add(tid)
+        cached=TYPE_NAME_RUNTIME_CACHE.get(tid)
+        if cached:out[tid]=cached
+        else:clean.append(tid)
+    if not clean or not DB.exists():return out
+    try:
+        con=sqlite3.connect(DB)
+        for pos in range(0,len(clean),800):
+            chunk=clean[pos:pos+800]
+            marks=','.join('?' for _ in chunk)
+            for tid,name in con.execute(f'SELECT id,name FROM types WHERE id IN ({marks})',chunk).fetchall():
+                if name:
+                    tid=int(tid); name=str(name); TYPE_NAME_RUNTIME_CACHE[tid]=name; out[tid]=name
+        con.close()
+    except Exception:
+        try:con.close()
+        except Exception:pass
+    return out
+
 def _local_type_name(type_id):
     try:tid=int(type_id)
     except Exception:return None
@@ -1320,7 +1419,7 @@ def _local_type_name(type_id):
 def type_name(type_id):
     try:tid=int(type_id)
     except Exception:return 'Unresolved EVE type'
-    return _local_type_name(tid) or f'Unresolved EVE type ({tid})'
+    return _local_type_name(tid) or f'EVE type {tid} (name unavailable)'
 
 def _fetch_type_from_esi(type_id):
     """Resolve one inventory type from CCP's public type endpoint.
@@ -1344,34 +1443,31 @@ def _fetch_type_from_esi(type_id):
 def ensure_type_names(type_ids):
     """Ensure ships, skills and item type IDs have readable EVE names.
 
-    First uses the local SDE database. Missing entries are repaired from CCP's
-    public `/universe/types/{type_id}` endpoint and cached locally. This makes
-    name resolution work even if an older install has a damaged/incomplete SDE
-    cache and avoids the incorrect `/universe/names` fallback used previously.
+    The full CCP SDE is the primary source.  Missing rows are repaired from the
+    public `/universe/types/{type_id}` route and cached locally.  Local lookups
+    are performed in bulk so large asset inventories do not open SQLite once per
+    row.
     """
     clean=[]; seen=set()
     for value in type_ids or []:
         try:tid=int(value or 0)
         except Exception:continue
-        if tid>0 and tid not in seen and not _local_type_name(tid):
+        if tid>0 and tid not in seen:
             seen.add(tid); clean.append(tid)
     if not clean:return 0
+    present=_bulk_local_type_names(clean)
+    missing=[tid for tid in clean if tid not in present]
+    if not missing:return 0
 
     rows=[]
-    # Keep concurrency modest so a character with a large asset list does not
-    # hammer ESI. Results are cached in SQLite, so each missing type normally
-    # needs to be fetched only once.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8,len(clean))) as pool:
-        for rec in pool.map(_fetch_type_from_esi,clean):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(6,len(missing))) as pool:
+        for rec in pool.map(_fetch_type_from_esi,missing):
             if not rec:continue
             rows.append(rec); TYPE_NAME_RUNTIME_CACHE[int(rec[0])]=str(rec[1])
 
     if rows and DB.exists():
         try:
             con=sqlite3.connect(DB,timeout=30)
-            # Create the cache table defensively so name repair also works on a
-            # legacy/partially-upgraded database instead of silently doing
-            # nothing when the SDE update previously failed.
             con.execute('CREATE TABLE IF NOT EXISTS types(id INTEGER PRIMARY KEY,name TEXT COLLATE NOCASE,group_id INTEGER,market_group_id INTEGER,volume REAL,published INTEGER)')
             con.execute('CREATE INDEX IF NOT EXISTS ix_type_name ON types(name)')
             con.executemany('INSERT OR REPLACE INTO types(id,name,group_id,market_group_id,volume,published) VALUES(?,?,?,?,?,?)',rows)
@@ -1406,12 +1502,29 @@ def type_search(query,limit=50):
     except Exception:return []
 
 def system_by_id(system_id):
+    """Capital-navigation system lookup (intentionally K-space constrained)."""
     if not DB.exists():return None
     try:
         con=sqlite3.connect(DB)
         row=con.execute('SELECT s.id,s.name,s.x,s.y,s.z,s.security,s.region_id,COALESCE(r.name,"Unknown region"),COALESCE(s.station_count,0) FROM systems s LEFT JOIN regions r ON r.id=s.region_id WHERE s.id=?',(int(system_id),)).fetchone()
         con.close(); return row
     except Exception:return None
+
+def display_system_by_id(system_id):
+    """Universe-wide system lookup used for human-readable telemetry.
+
+    Unlike system_by_id(), this includes wormholes/special/new system ID ranges
+    from the current SDE.  Keeping it separate prevents display-name support from
+    accidentally changing capital route legality.
+    """
+    if not DB.exists():return None
+    try:
+        con=sqlite3.connect(DB)
+        row=con.execute('SELECT s.id,s.name,s.x,s.y,s.z,s.security,s.region_id,COALESCE(r.name,"Unknown region"),COALESCE(s.station_count,0) FROM universe_systems s LEFT JOIN regions r ON r.id=s.region_id WHERE s.id=?',(int(system_id),)).fetchone()
+        if not row:
+            row=con.execute('SELECT s.id,s.name,s.x,s.y,s.z,s.security,s.region_id,COALESCE(r.name,"Unknown region"),COALESCE(s.station_count,0) FROM systems s LEFT JOIN regions r ON r.id=s.region_id WHERE s.id=?',(int(system_id),)).fetchone()
+        con.close(); return row
+    except Exception:return system_by_id(system_id)
 
 def stations_in_system(system_id):
     if not DB.exists():return []
@@ -1425,52 +1538,201 @@ def location_to_system(location_id):
     """Resolve a solar-system or NPC-station location ID to a local system row."""
     try: lid=int(location_id)
     except Exception:return None
-    direct=system_by_id(lid)
+    direct=display_system_by_id(lid)
     if direct:return direct
     if not DB.exists():return None
     try:
         con=sqlite3.connect(DB); r=con.execute('SELECT system_id FROM stations WHERE id=?',(lid,)).fetchone(); con.close()
-        return system_by_id(r[0]) if r else None
+        return display_system_by_id(r[0]) if r else None
     except Exception:return None
 
 def location_label(location_id):
     try: lid=int(location_id)
     except Exception:return str(location_id or '—')
-    sysrow=system_by_id(lid)
+    sysrow=display_system_by_id(lid)
     if sysrow:return sysrow[1]
     if DB.exists():
         try:
             con=sqlite3.connect(DB); r=con.execute('SELECT system_id,owner_name,operation_name,name FROM stations WHERE id=?',(lid,)).fetchone(); con.close()
             if r:
-                sr=system_by_id(r[0]); base=(r[3] or ' — '.join(x for x in (r[1],r[2]) if x) or f'NPC Station {lid}')
+                sr=display_system_by_id(r[0]); base=(r[3] or ' — '.join(x for x in (r[1],r[2]) if x) or f'NPC Station {lid}')
                 return f'{base} ({sr[1] if sr else r[0]})'
         except Exception:pass
     return 'Unresolved location'
 
-def gate_neighborhood(origin_name,max_hops=10):
-    """Return systems reachable within N normal stargate hops from origin.
+_GATE_GRAPH_CACHE={'signature':None,'nodes':{},'adj':{}}
 
-    The graph comes from CCP's SDE mapStargates table. Results include the
-    origin at hop 0 and are returned as (system_row, hops).
-    """
-    origin=system(origin_name)
-    if not origin or not DB.exists(): return origin,[]
-    try:max_hops=max(1,min(30,int(max_hops)))
-    except Exception:max_hops=10
+def _read_json_file(path,default):
+    try:
+        data=json.loads(Path(path).read_text(encoding='utf-8'))
+        return data if isinstance(data,type(default)) else default
+    except Exception:
+        return default
+
+def _write_json_file(path,data):
+    try:
+        tmp=Path(str(path)+'.tmp')
+        tmp.write_text(json.dumps(data,separators=(',',':')),encoding='utf-8')
+        os.replace(tmp,path)
+        return True
+    except Exception:
+        return False
+
+def gate_graph_snapshot():
+    """Return cached SDE stargate nodes/adjacency, reloading only when eve.db changes."""
+    if not DB.exists(): return {},{}
+    try: signature=(DB.stat().st_mtime_ns,DB.stat().st_size)
+    except Exception: signature=None
+    if _GATE_GRAPH_CACHE.get('signature')==signature and _GATE_GRAPH_CACHE.get('nodes'):
+        return _GATE_GRAPH_CACHE['nodes'],_GATE_GRAPH_CACHE['adj']
     con=sqlite3.connect(DB)
     try:
         edges=con.execute('SELECT a,b FROM stargates').fetchall()
         rows=con.execute('SELECT s.id,s.name,s.x,s.y,s.z,s.security,s.region_id,COALESCE(r.name,"Unknown region"),COALESCE(s.station_count,0) FROM systems s LEFT JOIN regions r ON r.id=s.region_id').fetchall()
-    finally: con.close()
+    finally:
+        con.close()
     nodes={int(r[0]):r for r in rows}; adj={}
     for a,b in edges:
         a=int(a); b=int(b); adj.setdefault(a,[]).append(b); adj.setdefault(b,[]).append(a)
-    seen={int(origin[0]):0}; q=deque([int(origin[0])])
+    _GATE_GRAPH_CACHE.update({'signature':signature,'nodes':nodes,'adj':adj})
+    return nodes,adj
+
+def gate_path_ids(start_id,dest_id,max_hops=100,adj=None):
+    try:start_id=int(start_id); dest_id=int(dest_id)
+    except Exception:return None
+    if start_id==dest_id:return [start_id]
+    if adj is None:_,adj=gate_graph_snapshot()
+    parent={start_id:None}; depth={start_id:0}; q=deque([start_id])
+    while q:
+        sid=q.popleft()
+        if depth[sid]>=max_hops:continue
+        for nxt in adj.get(sid,()):
+            if nxt in parent:continue
+            parent[nxt]=sid; depth[nxt]=depth[sid]+1
+            if nxt==dest_id:
+                ids=[]; cur=nxt
+                while cur is not None:ids.append(cur); cur=parent.get(cur)
+                return list(reversed(ids))
+            q.append(nxt)
+    return None
+
+def gate_distances(start_id,max_hops=100,adj=None):
+    if adj is None:_,adj=gate_graph_snapshot()
+    try:start_id=int(start_id)
+    except Exception:return {},{}
+    parent={start_id:None}; dist={start_id:0}; q=deque([start_id])
+    while q:
+        sid=q.popleft()
+        if dist[sid]>=max_hops:continue
+        for nxt in adj.get(sid,()):
+            if nxt in dist:continue
+            dist[nxt]=dist[sid]+1; parent[nxt]=sid; q.append(nxt)
+    return dist,parent
+
+def gate_path_from_parent(parent,dest_id):
+    if dest_id not in parent:return None
+    out=[]; cur=dest_id
+    while cur is not None:out.append(cur); cur=parent.get(cur)
+    return list(reversed(out))
+
+def hunt_topology(system_id,adj=None):
+    if adj is None:_,adj=gate_graph_snapshot()
+    degree=len(adj.get(int(system_id),()))
+    if degree<=0:return 'Isolated',0
+    if degree==1:return 'Dead-end',1
+    if degree==2:return 'Pipe',2
+    if degree==3:return 'Junction',3
+    return 'Hub',degree
+
+def load_hunting_activity_history():
+    data=_read_json_file(HUNT_HISTORY_FILE,{})
+    return data if isinstance(data,dict) else {}
+
+def save_hunting_activity_history(data):
+    return _write_json_file(HUNT_HISTORY_FILE,data)
+
+def load_zkill_cache():
+    data=_read_json_file(ZKILL_CACHE_FILE,{})
+    return data if isinstance(data,dict) else {}
+
+def save_zkill_cache(data):
+    return _write_json_file(ZKILL_CACHE_FILE,data)
+
+def fetch_zkill_system(system_id,past_seconds=604800):
+    """Fetch up to 200 recent public zKillboard killmails for one solar system.
+
+    zKillboard asks clients to identify themselves, cache killmail queries for an
+    hour, and use trailing slashes. The caller is responsible for enforcing the
+    local one-hour cache.
+    """
+    sid=int(system_id); seconds=max(3600,min(604800,int(past_seconds)//3600*3600))
+    url=f'https://zkillboard.com/api/solarSystemID/{sid}/pastSeconds/{seconds}/'
+    req=urllib.request.Request(url,headers={
+        'User-Agent':'New Eden Command/3.5.1 (+https://github.com/jamesronaldthorn-cpu/New-Eden-Command)',
+        'Accept':'application/json','Accept-Encoding':'gzip',
+    })
+    with urllib.request.urlopen(req,timeout=30) as r:
+        raw=r.read()
+        if str(r.headers.get('Content-Encoding','')).lower()=='gzip':raw=gzip.decompress(raw)
+    data=json.loads(raw.decode('utf-8'))
+    if isinstance(data,dict) and data.get('error'):raise RuntimeError(str(data.get('error')))
+    if not isinstance(data,list):raise RuntimeError('zKillboard returned an unexpected response.')
+    return data[:200]
+
+def summarize_zkill_kills(kills):
+    kills=kills if isinstance(kills,list) else []
+    victim_ids=[]; attacker_ids=[]; total_value=0.0; multi_attacker=0; newest=''
+    for km in kills:
+        if not isinstance(km,dict):continue
+        try:
+            tid=int((km.get('victim') or {}).get('ship_type_id') or 0)
+            if tid:victim_ids.append(tid)
+        except Exception:pass
+        attackers=km.get('attackers') or []
+        if len(attackers)>=3:multi_attacker+=1
+        for a in attackers:
+            try:
+                tid=int((a or {}).get('ship_type_id') or 0)
+                if tid:attacker_ids.append(tid)
+            except Exception:pass
+        try:total_value+=float((km.get('zkb') or {}).get('totalValue') or 0)
+        except Exception:pass
+        t=str(km.get('killmail_time') or '')
+        if t and (not newest or t>newest):newest=t
+    # Resolve from the local SDE cache only here; the normal type resolver can repair
+    # names elsewhere without turning a zKill summary into hundreds of ESI calls.
+    def counts(ids):
+        out={}
+        for tid in ids:
+            name=type_name(tid)
+            out[name]=out.get(name,0)+1
+        return sorted(out.items(),key=lambda x:(-x[1],x[0].casefold()))
+    victims=counts(victim_ids); attackers=counts(attacker_ids)
+    vnames=[n.casefold() for n,_ in victims]
+    ratter_tokens=('ishtar','gila','vexor navy issue','myrmidon','dominix','rattlesnake','praxis','vargur','paladin','kronos','golem','thanatos','nidhoggur','archon','chimera')
+    miner_tokens=('hulk','mackinaw','skiff','retriever','covetor','procurer','orca','rorqual','venture','prospect','endurance')
+    ratter=sum(c for n,c in victims if any(t in n.casefold() for t in ratter_tokens))
+    miners=sum(c for n,c in victims if any(t in n.casefold() for t in miner_tokens))
+    if ratter>=2:classification='Ratter losses'
+    elif miners>=2:classification='Mining losses'
+    elif multi_attacker>=max(2,len(kills)//4):classification='Gang / camp activity'
+    elif len(kills)>=8:classification='PvP hotspot'
+    elif kills:classification='Recent kills'
+    else:classification='No recent zKill signal'
+    return {'count':len(kills),'total_value':total_value,'newest':newest,'victims':victims[:6],'attackers':attackers[:6],'classification':classification,'ratter_losses':ratter,'miner_losses':miners,'gang_kills':multi_attacker}
+
+def gate_neighborhood(origin_name,max_hops=10):
+    """Return systems reachable within N normal stargate hops from origin."""
+    origin=system(origin_name)
+    if not origin or not DB.exists(): return origin,[]
+    try:max_hops=max(1,min(30,int(max_hops)))
+    except Exception:max_hops=10
+    nodes,adj=gate_graph_snapshot(); seen={int(origin[0]):0}; q=deque([int(origin[0])])
     while q:
         sid=q.popleft(); h=seen[sid]
-        if h>=max_hops: continue
+        if h>=max_hops:continue
         for nxt in adj.get(sid,()):
-            if nxt in seen: continue
+            if nxt in seen:continue
             seen[nxt]=h+1; q.append(nxt)
     out=[(nodes[sid],h) for sid,h in seen.items() if sid in nodes]
     out.sort(key=lambda x:(x[1],x[0][1].casefold()))
@@ -1478,28 +1740,10 @@ def gate_neighborhood(origin_name,max_hops=10):
 
 def gate_shortest_path(start_name,dest_name,max_hops=80):
     start=system(start_name); dest=system(dest_name)
-    if not start or not dest or not DB.exists(): return None
-    if start[0]==dest[0]: return [start]
-    con=sqlite3.connect(DB)
-    try: edges=con.execute('SELECT a,b FROM stargates').fetchall()
-    finally: con.close()
-    adj={}
-    for a,b in edges:
-        adj.setdefault(int(a),[]).append(int(b)); adj.setdefault(int(b),[]).append(int(a))
-    parent={int(start[0]):None}; depth={int(start[0]):0}; q=deque([int(start[0])])
-    found=False
-    while q:
-        sid=q.popleft()
-        if depth[sid]>=max_hops: continue
-        for nxt in adj.get(sid,()):
-            if nxt in parent: continue
-            parent[nxt]=sid; depth[nxt]=depth[sid]+1
-            if nxt==int(dest[0]): found=True; q.clear(); break
-            q.append(nxt)
-    if not found:return None
-    ids=[]; cur=int(dest[0])
-    while cur is not None: ids.append(cur); cur=parent.get(cur)
-    ids.reverse(); return [system_by_id(x) for x in ids if system_by_id(x)]
+    if not start or not dest or not DB.exists():return None
+    nodes,adj=gate_graph_snapshot(); ids=gate_path_ids(start[0],dest[0],max_hops,adj)
+    return [nodes[i] for i in ids if i in nodes] if ids else None
+
 
 def fetch_hunting_intel():
     """Public CCP hunting inputs: last-hour jumps/kills + current sovereignty systems.
@@ -1551,6 +1795,7 @@ def hunting_score(mode,rec,sec,has_sov=False,observed_main=0.0):
     if mode=='Ratter Hunt': raw=rat + pvp*0.28
     elif mode=='PvP Activity': raw=pvp + rat*0.12
     elif mode=='ESS Hunt': raw=ess*1.6 + pvp*0.18
+    elif mode=='Blops Hunt': raw=rat*0.75 + pvp*0.55 + ess*0.20
     else: raw=rat*0.55 + pvp*0.75 + ess*0.35
     return int(max(0,min(999,round(raw))))
 
@@ -2125,17 +2370,22 @@ class App(tk.Tk):
         self.hunt_security=tk.StringVar(value=str(state.get('hunt_security','Low + Null')))
         if self.hunt_security.get() not in ('All k-space','Low + Null','Null only'): self.hunt_security.set('Low + Null')
         self.hunt_mode=tk.StringVar(value=str(state.get('hunt_mode','Ratter Hunt')))
-        if self.hunt_mode.get() not in ('Ratter Hunt','PvP Activity','ESS Hunt','Balanced Roam'): self.hunt_mode.set('Ratter Hunt')
+        if self.hunt_mode.get() not in ('Ratter Hunt','PvP Activity','ESS Hunt','Balanced Roam','Blops Hunt'): self.hunt_mode.set('Ratter Hunt')
         self.hunt_min_npc=tk.IntVar(value=max(0,int(state.get('hunt_min_npc',0) or 0)))
+        self.hunt_roam_jumps=tk.IntVar(value=max(5,min(60,int(state.get('hunt_roam_jumps',15) or 15))))
         self.hunt_status=tk.StringVar(value='Choose an origin and scan nearby stargate space. Exact pilots-in-space and ESS balances are not public ESI data.')
         self.hunt_metric_systems=tk.StringVar(value='—'); self.hunt_metric_ratting=tk.StringVar(value='—'); self.hunt_metric_pvp=tk.StringVar(value='—'); self.hunt_metric_ess=tk.StringVar(value='—')
-        self.hunt_tree=None; self.hunt_results=[]
+        self.hunt_tree=None; self.hunt_results=[]; self.hunt_map_canvas=None; self.hunt_map_hitboxes=[]; self.hunt_map_nodes=[]
+        self.hunt_dossier_text=None; self.hunt_roam_tree=None; self.hunt_roam_nodes=[]; self.hunt_roam_status=tk.StringVar(value='Build a scored gate route from the current hunting scan.')
+        self.hunt_activity_history=load_hunting_activity_history(); self.hunt_zkill_cache=load_zkill_cache(); self.hunt_zkill_running=False
+        self.hunt_manual_intel=self.config.get('hunt_manual_intel',{}) if isinstance(self.config.get('hunt_manual_intel',{}),dict) else {}
+        self.hunt_visit_history=self.config.get('hunt_visit_history',{}) if isinstance(self.config.get('hunt_visit_history',{}),dict) else {}
         self.ess_observations=self.config.get('ess_observations',{}) if isinstance(self.config.get('ess_observations',{}),dict) else {}
         self.build_ui(); self.update_ship_controls(); self.protocol('WM_DELETE_WINDOW',self.on_close); self.after(200,self.startup)
         if self.pending_update_arg:
             self.after(450,self.handle_command_line_update)
     def build_ui(self):
-        # v3.4.6 shell — responsive command interface with DPI-safe navigation
+        # v3.5.0 shell — responsive command interface with DPI-safe navigation
         # rail and scrollable pages.  The inner tools remain the same; the shell
         # now adapts rather than clipping controls when Windows is resized.
         shell=ttk.Frame(self,style='Hero.TFrame'); shell.pack(fill='both',expand=True)
@@ -2437,18 +2687,18 @@ class App(tk.Tk):
         ttk.Button(sp_bar,text='OPEN CHARACTERS',command=lambda:self.tabs.select(self.character_tab)).pack(side='left',padx=(6,0))
         ttk.Label(sp_bar,textvariable=self.skillplan_status,style='HUD.TLabel').pack(side='left',padx=(14,0))
 
-        # Hunting / Roam Intelligence — stargate-local target discovery using public
-        # CCP last-hour activity plus sovereignty context. Exact local population and
-        # ESS bank values are intentionally not guessed because ESI does not expose them.
+        # Hunting / Roam Intelligence — command workspace combining public CCP
+        # activity, local history, graph topology, optional zKill enrichment and
+        # player-recorded observations. No unavailable live-local/ESS data is guessed.
         hunt_head=ttk.Frame(hunting); hunt_head.pack(fill='x',pady=(0,10)); hunt_head.columnconfigure(0,weight=1)
-        ttk.Label(hunt_head,text='HUNTING // ROAM INTELLIGENCE',style='SectionTitle.TLabel').grid(row=0,column=0,sticky='w')
-        ttk.Label(hunt_head,text='Find nearby ratting, PvP and likely ESS targets by normal stargate hops from an origin system.',style='SectionSub.TLabel').grid(row=1,column=0,sticky='w')
+        ttk.Label(hunt_head,text='HUNTING // ROAM COMMAND',style='SectionTitle.TLabel').grid(row=0,column=0,sticky='w')
+        ttk.Label(hunt_head,text='Activity trends • system dossiers • chokepoints • roam routes • manual intel • ESS • optional zKill context • Blops reach',style='SectionSub.TLabel',wraplength=900).grid(row=1,column=0,sticky='w')
         ha=ttk.Frame(hunt_head); ha.grid(row=0,column=1,rowspan=2,sticky='e')
         ttk.Button(ha,text='REFRESH CCP INTEL',command=lambda:self.refresh_hunting_intel(True),style='Ghost.TButton').pack(side='left')
         ttk.Button(ha,text='SCAN AREA',command=self.scan_hunting_area,style='Accent.TButton').pack(side='left',padx=(6,0))
 
         filters=ttk.Frame(hunting,style='Panel.TFrame',padding=(12,10)); filters.pack(fill='x',pady=(0,10))
-        for c in range(5):filters.columnconfigure(c,weight=1)
+        for c in range(6):filters.columnconfigure(c,weight=1)
         ttk.Label(filters,text='ORIGIN SYSTEM',style='PanelHUD.TLabel').grid(row=0,column=0,sticky='w')
         hunt_entry=AutoCompleteEntry(filters,textvariable=self.hunt_origin); hunt_entry.grid(row=1,column=0,sticky='ew',padx=(0,8)); self.bind_system_entry_context(hunt_entry,self.hunt_origin)
         ttk.Label(filters,text='MAX GATE HOPS',style='PanelHUD.TLabel').grid(row=0,column=1,sticky='w')
@@ -2456,9 +2706,11 @@ class App(tk.Tk):
         ttk.Label(filters,text='SPACE FILTER',style='PanelHUD.TLabel').grid(row=0,column=2,sticky='w')
         ttk.Combobox(filters,textvariable=self.hunt_security,values=['All k-space','Low + Null','Null only'],state='readonly').grid(row=1,column=2,sticky='ew',padx=(0,8))
         ttk.Label(filters,text='HUNT PROFILE',style='PanelHUD.TLabel').grid(row=0,column=3,sticky='w')
-        ttk.Combobox(filters,textvariable=self.hunt_mode,values=['Ratter Hunt','PvP Activity','ESS Hunt','Balanced Roam'],state='readonly').grid(row=1,column=3,sticky='ew',padx=(0,8))
+        ttk.Combobox(filters,textvariable=self.hunt_mode,values=['Ratter Hunt','PvP Activity','ESS Hunt','Balanced Roam','Blops Hunt'],state='readonly').grid(row=1,column=3,sticky='ew',padx=(0,8))
         ttk.Label(filters,text='MIN NPC KILLS / HOUR',style='PanelHUD.TLabel').grid(row=0,column=4,sticky='w')
-        ttk.Spinbox(filters,from_=0,to=100000,textvariable=self.hunt_min_npc,width=10).grid(row=1,column=4,sticky='ew')
+        ttk.Spinbox(filters,from_=0,to=100000,textvariable=self.hunt_min_npc,width=10).grid(row=1,column=4,sticky='ew',padx=(0,8))
+        ttk.Label(filters,text='ROAM JUMPS',style='PanelHUD.TLabel').grid(row=0,column=5,sticky='w')
+        ttk.Spinbox(filters,from_=5,to=60,textvariable=self.hunt_roam_jumps,width=8).grid(row=1,column=5,sticky='ew')
 
         hcards=ttk.Frame(hunting); hcards.pack(fill='x',pady=(0,10))
         for c in range(4):hcards.columnconfigure(c,weight=1)
@@ -2466,21 +2718,46 @@ class App(tk.Tk):
             card=ttk.Frame(hcards,style='Card.TFrame',padding=(12,10)); card.grid(row=0,column=c,sticky='nsew',padx=(0 if c==0 else 4,0 if c==3 else 4))
             ttk.Label(card,text=title,style='CardTitle.TLabel').pack(anchor='w'); ttk.Label(card,textvariable=var,style='CardValue.TLabel',wraplength=250).pack(anchor='w',pady=(4,0))
 
-        hbody=ttk.Frame(hunting); hbody.pack(fill='both',expand=True); hbody.columnconfigure(0,weight=1); hbody.rowconfigure(0,weight=1)
-        self.hunt_tree=ttk.Treeview(hbody,columns=('rank','system','region','hops','sec','traffic','npc','ships','pods','score','ess','sov'),show='headings',selectmode='browse')
-        for col,title,w,anchor in [('rank','#',42,'e'),('system','System',120,'w'),('region','Region',110,'w'),('hops','Hops',55,'e'),('sec','Sec',58,'e'),('traffic','Jumps/h',70,'e'),('npc','NPC kills/h',82,'e'),('ships','Ship kills/h',82,'e'),('pods','Pod kills/h',78,'e'),('score','Hunt score',78,'e'),('ess','ESS / observed',125,'w'),('sov','Sov',58,'center')]:
-            self.hunt_tree.heading(col,text=title); self.hunt_tree.column(col,width=w,anchor=anchor)
-        self.hunt_tree.grid(row=0,column=0,sticky='nsew'); hsb=ttk.Scrollbar(hbody,orient='vertical',command=self.hunt_tree.yview); hsb.grid(row=0,column=1,sticky='ns'); hsh=ttk.Scrollbar(hbody,orient='horizontal',command=self.hunt_tree.xview); hsh.grid(row=1,column=0,sticky='ew'); self.hunt_tree.configure(yscrollcommand=hsb.set,xscrollcommand=hsh.set)
-        self.hunt_tree.tag_configure('hot',background='#173522'); self.hunt_tree.tag_configure('danger',background='#351a1f'); self.hunt_tree.tag_configure('ess',background='#2a2815')
+        target_panel=ttk.LabelFrame(hunting,text='TARGET BOARD',padding=(8,8)); target_panel.pack(fill='both',expand=True,pady=(0,10))
+        target_panel.columnconfigure(0,weight=1); target_panel.rowconfigure(0,weight=1)
+        self.hunt_tree=ttk.Treeview(target_panel,columns=('rank','system','region','hops','sec','trend','traffic','npc','ships','pods','score','topology','intel','ess','zkill','blops'),show='headings',selectmode='browse',height=12)
+        cols=[('rank','#',42,'e'),('system','System',120,'w'),('region','Region',115,'w'),('hops','Hops',55,'e'),('sec','Sec',58,'e'),('trend','Trend',72,'center'),('traffic','Jumps/h',70,'e'),('npc','NPC/h',70,'e'),('ships','Ships/h',65,'e'),('pods','Pods/h',60,'e'),('score','Score',60,'e'),('topology','Topology',90,'w'),('intel','Manual intel',130,'w'),('ess','ESS / observed',125,'w'),('zkill','zKill signal',125,'w'),('blops','Blops',95,'center')]
+        for col,title,w,anchor in cols:self.hunt_tree.heading(col,text=title); self.hunt_tree.column(col,width=w,anchor=anchor)
+        self.hunt_tree.grid(row=0,column=0,sticky='nsew'); hsb=ttk.Scrollbar(target_panel,orient='vertical',command=self.hunt_tree.yview); hsb.grid(row=0,column=1,sticky='ns'); hsh=ttk.Scrollbar(target_panel,orient='horizontal',command=self.hunt_tree.xview); hsh.grid(row=1,column=0,sticky='ew'); self.hunt_tree.configure(yscrollcommand=hsb.set,xscrollcommand=hsh.set)
+        self.hunt_tree.tag_configure('hot',background='#173522'); self.hunt_tree.tag_configure('danger',background='#351a1f'); self.hunt_tree.tag_configure('ess',background='#2a2815'); self.hunt_tree.tag_configure('rising',background='#123246')
+        self.hunt_tree.bind('<<TreeviewSelect>>',lambda e:self.hunt_update_dossier())
         self.hunt_tree.bind('<Double-1>',lambda e:self.hunt_set_selected_destination())
         self.hunt_tree.bind('<Button-3>',self.hunt_tree_context_menu)
-        hbar=ttk.Frame(hunting); hbar.pack(fill='x',pady=(8,0))
+        hbar=ttk.Frame(hunting); hbar.pack(fill='x',pady=(0,10))
         ttk.Button(hbar,text='SET DESTINATION IN EVE',command=self.hunt_set_selected_destination,style='Accent.TButton').pack(side='left')
-        ttk.Button(hbar,text='USE SELECTED AS NEW ORIGIN',command=self.hunt_use_selected_origin).pack(side='left',padx=6)
-        ttk.Button(hbar,text='RECORD OBSERVED ESS BANK',command=self.hunt_record_selected_ess).pack(side='left')
-        ttk.Button(hbar,text='CLEAR OBSERVED ESS',command=self.hunt_clear_selected_ess).pack(side='left',padx=6)
-        ttk.Label(hunting,textvariable=self.hunt_status,style='HUD.TLabel',wraplength=1060).pack(anchor='w',pady=(7,0))
-        ttk.Label(hunting,text='DATA NOTE  //  CCP ESI exposes last-hour jumps plus NPC/ship/pod kills, but not an exact pilots-in-space count or live ESS Main/Reserve Bank balances. ESS observations shown here are values you record from the in-game ESS UI; unobserved ESS targets are ranked as potential only.',style='SectionSub.TLabel',wraplength=1080).pack(anchor='w',pady=(4,0))
+        ttk.Button(hbar,text='USE AS ORIGIN',command=self.hunt_use_selected_origin).pack(side='left',padx=6)
+        ttk.Button(hbar,text='ADD MANUAL INTEL',command=self.hunt_add_manual_intel).pack(side='left')
+        ttk.Button(hbar,text='MARK VISITED',command=self.hunt_mark_visited).pack(side='left',padx=6)
+        ttk.Button(hbar,text='FETCH zKILL',command=self.hunt_fetch_selected_zkill).pack(side='left')
+        ttk.Button(hbar,text='RECORD ESS',command=self.hunt_record_selected_ess).pack(side='left',padx=6)
+        ttk.Button(hbar,text='PLAN BLOPS',command=self.hunt_plan_blops).pack(side='left')
+
+        dossier=ttk.LabelFrame(hunting,text='SYSTEM DOSSIER',padding=(10,8)); dossier.pack(fill='x',pady=(0,10))
+        self.hunt_dossier_text=tk.Text(dossier,height=9,bg='#0b141d',fg='#dce8ef',insertbackground='#dce8ef',relief='flat',wrap='word',font=('Consolas',9),padx=8,pady=8)
+        self.hunt_dossier_text.pack(fill='x',expand=True); self.hunt_dossier_text.insert('1.0','Select a target to open its dossier.'); self.hunt_dossier_text.configure(state='disabled')
+
+        map_panel=ttk.LabelFrame(hunting,text='TACTICAL HUNTING MAP',padding=(8,8)); map_panel.pack(fill='both',expand=True,pady=(0,10))
+        map_toolbar=ttk.Frame(map_panel); map_toolbar.pack(fill='x',pady=(0,6))
+        ttk.Button(map_toolbar,text='BUILD ROAM ROUTE',command=self.hunt_build_roam_route,style='Accent.TButton').pack(side='left')
+        ttk.Button(map_toolbar,text='COPY ROAM',command=self.hunt_copy_roam).pack(side='left',padx=6)
+        ttk.Button(map_toolbar,text='SEND ROAM TO EVE',command=self.hunt_send_roam_to_eve).pack(side='left')
+        ttk.Label(map_toolbar,textvariable=self.hunt_roam_status,style='HUD.TLabel').pack(side='left',padx=(12,0))
+        self.hunt_map_canvas=tk.Canvas(map_panel,background='#081018',highlightthickness=1,highlightbackground='#263b4b',height=330,cursor='crosshair')
+        self.hunt_map_canvas.pack(fill='both',expand=True); self.hunt_map_canvas.bind('<Configure>',lambda e:self.after_idle(self.redraw_hunting_map)); self.hunt_map_canvas.bind('<Button-1>',self.hunt_map_click)
+
+        roam_panel=ttk.LabelFrame(hunting,text='ROAM ROUTE',padding=(8,8)); roam_panel.pack(fill='both',expand=True,pady=(0,10))
+        roam_panel.columnconfigure(0,weight=1); roam_panel.rowconfigure(0,weight=1)
+        self.hunt_roam_tree=ttk.Treeview(roam_panel,columns=('step','system','region','sec','score','signal'),show='headings',height=7)
+        for col,title,w,anchor in [('step','#',42,'e'),('system','System',140,'w'),('region','Region',130,'w'),('sec','Sec',60,'e'),('score','Target score',90,'e'),('signal','Signal',240,'w')]:self.hunt_roam_tree.heading(col,text=title); self.hunt_roam_tree.column(col,width=w,anchor=anchor)
+        self.hunt_roam_tree.grid(row=0,column=0,sticky='nsew'); rsb=ttk.Scrollbar(roam_panel,orient='vertical',command=self.hunt_roam_tree.yview); rsb.grid(row=0,column=1,sticky='ns'); self.hunt_roam_tree.configure(yscrollcommand=rsb.set)
+
+        ttk.Label(hunting,textvariable=self.hunt_status,style='HUD.TLabel',wraplength=1180).pack(anchor='w',pady=(2,0))
+        ttk.Label(hunting,text='DATA NOTE  //  CCP ESI activity is delayed public data, not live local. Exact pilots-in-space and live ESS balances are not public ESI data. zKillboard enrichment is optional, historical, and cached for at least one hour; its killmail API withholds the newest few minutes. Manual intel is timestamped and expires automatically.',style='SectionSub.TLabel',wraplength=1180).pack(anchor='w',pady=(4,0))
 
         # Capital Operations: saved multi-ship move plans, cyno-chain execution,
         # aggregated fuel logistics, activity intelligence and route comparison.
@@ -2762,7 +3039,7 @@ class App(tk.Tk):
         ttk.Label(updates,text='Use a signed-by-hash .ejpupdate package locally, or configure an HTTPS update feed so the app can check and download new releases itself. Every downloaded package is checked against the feed SHA-256 and then its internal manifest SHA-256 values before installation. User data remains outside the install folder.',wraplength=920).pack(anchor='w',pady=(0,14))
 
         online=ttk.LabelFrame(updates,text='Online update feed',padding=12); online.pack(fill='x'); online.columnconfigure(0,weight=1)
-        ttk.Label(online,text='Feed URL (for GitHub Releases: https://github.com/jamesronaldthorn-cpu/New-Eden-Command/releases/latest/download/latest.json)').grid(row=0,column=0,columnspan=4,sticky='w')
+        ttk.Label(online,text='Feed URL (GitHub Releases: https://github.com/jamesronaldthorn-cpu/New-Eden-Command/releases/latest/download/latest.json)').grid(row=0,column=0,columnspan=4,sticky='w')
         ttk.Entry(online,textvariable=self.update_feed_url).grid(row=1,column=0,sticky='ew',pady=(6,0))
         ttk.Button(online,text='Save',command=self.save_update_feed).grid(row=1,column=1,padx=(8,4),pady=(6,0))
         self.online_check_btn=ttk.Button(online,text='Check online',command=lambda:self.check_online_update(manual=True)); self.online_check_btn.grid(row=1,column=2,padx=4,pady=(6,0))
@@ -3169,15 +3446,18 @@ class App(tk.Tk):
         try:eid=int(entity_id or 0)
         except Exception:return '—'
         if not eid:return '—'
-        local=location_label(eid) if kind=='location' else None
-        if local and local not in ('Unresolved location',):return local
+        # Prefer ESI-resolved/cache names first.  The official npcStations SDE
+        # does not contain station names, so a locally reconstructed label must
+        # not hide the exact name returned by /universe/names.
         names=(snap or {}).get('resolved_names',{}) if isinstance(snap,dict) else {}
         rec=names.get(str(eid),{}) if isinstance(names,dict) else {}
         if isinstance(rec,dict) and rec.get('name'):return str(rec.get('name'))
         cached=self._name_cache().get(str(eid),{})
         if isinstance(cached,dict) and cached.get('name'):return str(cached.get('name'))
+        local=location_label(eid) if kind=='location' else None
+        if local and local not in ('Unresolved location',):return local
         if kind=='location' and eid>=1_000_000_000_000:return 'Restricted / unresolved structure'
-        return 'Unresolved location' if kind=='location' else 'Unknown entity'
+        return (f'Location {eid} (name unavailable)' if kind=='location' else f'Entity {eid} (name unavailable)')
 
     def _resolved_location_system(self,snap,location_id):
         direct=location_to_system(location_id)
@@ -3189,9 +3469,20 @@ class App(tk.Tk):
         if not rec:
             cached=self._name_cache().get(str(lid),{})
             rec=cached if isinstance(cached,dict) else {}
-        try:sid=int(rec.get('system_id') or 0)
+        category=str(rec.get('category') or '').lower() if isinstance(rec,dict) else ''
+        try:sid=int(rec.get('system_id') or (lid if category in ('solar_system','system') else 0))
         except Exception:sid=0
-        return system_by_id(sid) if sid else None
+        if not sid:return None
+        row=display_system_by_id(sid)
+        if row:return row
+        sysrec=names.get(str(sid),{}) if isinstance(names,dict) else {}
+        if not sysrec:
+            cached=self._name_cache().get(str(sid),{})
+            sysrec=cached if isinstance(cached,dict) else {}
+        if isinstance(sysrec,dict) and sysrec.get('name'):
+            pos=sysrec.get('position') if isinstance(sysrec.get('position'),dict) else {}
+            return (sid,str(sysrec.get('name')),float(pos.get('x',0) or 0),float(pos.get('y',0) or 0),float(pos.get('z',0) or 0),float(sysrec.get('security',0) or 0),int(sysrec.get('region_id',0) or 0),str(sysrec.get('region_name') or 'Unknown region'),0)
+        return None
 
     def _resolve_snapshot_names(self,cid,snap,access,scopes):
         """Resolve IDs in a character snapshot to player-facing EVE names.
@@ -3300,6 +3591,32 @@ class App(tk.Tk):
                 previous=resolved.get(str(eid),{}) if isinstance(resolved.get(str(eid),{}),dict) else {}
                 merged=dict(previous); merged.update(rec)
                 resolved[str(eid)]=merged; cache[str(eid)]=merged
+
+        # Build an explicit set of system IDs and repair any system that is not
+        # present in the local display index.  This covers new/special system ID
+        # ranges and station/structure roots without allowing those systems into
+        # capital route calculations.
+        system_ids=set()
+        loc=snap.get('location') or {}
+        if isinstance(loc,dict):
+            try:
+                sid=int(loc.get('solar_system_id') or 0)
+                if sid:system_ids.add(sid)
+            except Exception:pass
+        for eid in location_ids:
+            row=location_to_system(eid)
+            if row:system_ids.add(int(row[0]));continue
+            rec=resolved.get(str(eid),{}) if isinstance(resolved.get(str(eid),{}),dict) else {}
+            try:
+                sid=int(rec.get('system_id') or (eid if str(rec.get('category') or '').lower() in ('solar_system','system') else 0))
+            except Exception:sid=0
+            if sid:system_ids.add(sid)
+        missing_systems=[sid for sid in sorted(system_ids) if not display_system_by_id(sid) and not (resolved.get(str(sid),{}) or {}).get('name')]
+        if missing_systems:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(6,len(missing_systems))) as pool:
+                for sid,rec in zip(missing_systems,pool.map(resolve_system_info,missing_systems)):
+                    if rec and rec.get('name'):
+                        resolved[str(sid)]=rec; cache[str(sid)]=rec
         snap['resolved_names']=resolved
         return snap
 
@@ -3378,6 +3695,19 @@ class App(tk.Tk):
         return tuple(parts)
 
     def refresh_command_center_views(self,force=False):
+        # Prime every currently cached display type in one SQLite pass.  This
+        # removes the old per-row database cost on large inventories and ensures
+        # freshly rebuilt SDE names appear immediately without another ESI sync.
+        type_ids=[]
+        for _snap in self._companion_cache().values():
+            if not isinstance(_snap,dict):continue
+            _ship=_snap.get('ship') or {}
+            if isinstance(_ship,dict):type_ids.append(_ship.get('ship_type_id'))
+            type_ids.extend(a.get('type_id') for a in (_snap.get('assets') or []) if isinstance(a,dict))
+            for j in _snap.get('industry_jobs') or []:
+                if isinstance(j,dict):type_ids.extend((j.get('blueprint_type_id'),j.get('product_type_id')))
+            type_ids.extend(q.get('skill_id') for q in (_snap.get('skillqueue') or []) if isinstance(q,dict))
+        _bulk_local_type_names(type_ids)
         signature=self._command_center_state_signature()
         if not force and signature==self._command_center_snapshot_signature:
             # Selection metrics are cheap and may have changed even when the ESI cache did not.
@@ -3389,7 +3719,7 @@ class App(tk.Tk):
                 try:cid=int(rec.get('character_id') or key)
                 except Exception:continue
                 snap=cache.get(str(cid),{}) if isinstance(cache.get(str(cid),{}),dict) else {}
-                loc=snap.get('location') or {}; sysrow=system_by_id(loc.get('solar_system_id')) if loc else None
+                loc=snap.get('location') or {}; sysrow=self._resolved_location_system(snap,loc.get('solar_system_id')) if loc else None
                 ship=snap.get('ship') or {}; online=snap.get('online') or {}; wallet=snap.get('wallet'); clones=snap.get('clones') or {}
                 clone_count=len(clones.get('jump_clones',[]) or []) if isinstance(clones,dict) else 0
                 self.command_char_tree.insert('', 'end', iid=str(cid), values=(
@@ -3405,7 +3735,7 @@ class App(tk.Tk):
             try:cid=int(self.command_char_tree.selection()[0])
             except Exception:cid=0
         if not cid:cid=int(self.esi_character_id or 0)
-        snap=self._snapshot_for(cid); loc=snap.get('location') or {}; sr=system_by_id(loc.get('solar_system_id')) if loc else None; ship=snap.get('ship') or {}; online=snap.get('online') or {}; wallet=snap.get('wallet')
+        snap=self._snapshot_for(cid); loc=snap.get('location') or {}; sr=self._resolved_location_system(snap,loc.get('solar_system_id')) if loc else None; ship=snap.get('ship') or {}; online=snap.get('online') or {}; wallet=snap.get('wallet')
         self.command_metric_location.set((f'{sr[1]}\n{sr[7]}' if sr else '—'))
         self.command_metric_ship.set((f"{type_name(ship.get('ship_type_id'))}\n{ship.get('ship_name','')}" if ship else '—'))
         self.command_metric_wallet.set((f'{float(wallet):,.0f} ISK' if isinstance(wallet,(int,float)) else '—'))
@@ -3425,7 +3755,7 @@ class App(tk.Tk):
         if self.command_char_tree is not None and self.command_char_tree.selection():
             try:cid=int(self.command_char_tree.selection()[0])
             except Exception:pass
-        snap=self._snapshot_for(cid or self.esi_character_id); loc=snap.get('location') or {}; sr=system_by_id(loc.get('solar_system_id')) if loc else None
+        snap=self._snapshot_for(cid or self.esi_character_id); loc=snap.get('location') or {}; sr=self._resolved_location_system(snap,loc.get('solar_system_id')) if loc else None
         if not sr:messagebox.showinfo('Command Center','Sync a character with location permission first.',parent=self);return
         self.route_from.set(sr[1]); self.quick_from.set(sr[1]); self.tabs.select(self.planner_tab)
 
@@ -3952,7 +4282,7 @@ class App(tk.Tk):
             messagebox.showinfo('Contract route','The start or destination could not be resolved to a solar system. Re-sync the character; restricted player structures may also require the structure-read permission and docking access.',parent=self);return
         self.route_from.set(a[1]); self.route_to.set(b[1]); self.tabs.select(self.planner_tab); self.find_route()
 
-    # -------------------- v3.1 Hunting / Roam Intelligence --------------------
+    # -------------------- v3.5 Hunting / Roam Command --------------------
     def _hunting_cache_age(self):
         try:ts=int(self.hunting_data.get('fetched_at',0) or 0)
         except Exception:ts=0
@@ -3977,7 +4307,6 @@ class App(tk.Tk):
             if self.hunting_data:self.scan_hunting_area(use_cached=True)
             return
         self.hunting_data=data or {}; self.config['hunting_cache']=self.hunting_data
-        # Keep Capital Ops activity context on the same fresh CCP snapshot.
         self.activity_data={'systems':dict(self.hunting_data.get('systems',{})),'fetched_at':self.hunting_data.get('fetched_at'),'source':'CCP ESI via Hunting Intel'}
         self.config['activity_cache']=self.activity_data; save_config(self.config)
         self.scan_hunting_area(use_cached=True)
@@ -3986,6 +4315,10 @@ class App(tk.Tk):
         if self.hunt_tree is None or not self.hunt_tree.selection():return ''
         vals=self.hunt_tree.item(self.hunt_tree.selection()[0],'values')
         return str(vals[1]) if len(vals)>1 else ''
+
+    def _hunt_result(self,name):
+        key=str(name or '').casefold()
+        return next((r for r in self.hunt_results if str(r['node'][1]).casefold()==key),None)
 
     def _ess_observation(self,system_name):
         rec=self.ess_observations.get(str(system_name).casefold(),{})
@@ -3997,8 +4330,102 @@ class App(tk.Tk):
             bits=[]
             if main>0:bits.append('M '+format_isk_short(main))
             if reserve>0:bits.append('R '+format_isk_short(reserve))
+            age=max(0,int(time.time())-int(obs.get('observed_at',0) or 0)) if obs.get('observed_at') else 0
+            if age:bits.append(f'{age//3600}h old' if age>=3600 else f'{age//60}m old')
             return ' / '.join(bits)
         return 'Potential' if ess_candidate else '—'
+
+    def _hunt_active_manual_intel(self,system_name):
+        key=str(system_name).casefold(); rec=self.hunt_manual_intel.get(key,{})
+        if not isinstance(rec,dict):return {}
+        expiry=int(rec.get('expires_at',0) or 0)
+        if expiry and expiry<=int(time.time()):
+            self.hunt_manual_intel.pop(key,None); return {}
+        return rec
+
+    def _hunt_manual_text(self,system_name):
+        rec=self._hunt_active_manual_intel(system_name)
+        if not rec:return '—'
+        tag=str(rec.get('tag') or 'Intel'); expiry=int(rec.get('expires_at',0) or 0)
+        left=max(0,expiry-int(time.time())) if expiry else 0
+        age=f'{max(1,left//60)}m' if left<3600 else f'{max(1,left//3600)}h'
+        return f'{tag} ({age})'
+
+    def _hunt_record_activity_history(self,nearby,systems_data,fetched_at):
+        try:ts=int(fetched_at or 0)
+        except Exception:ts=0
+        if not ts:return
+        now=int(time.time()); touched=False
+        for node,_hops in nearby:
+            sid=str(int(node[0])); rec=systems_data.get(sid,{}) if isinstance(systems_data,dict) else {}
+            samples=self.hunt_activity_history.setdefault(sid,[])
+            if not isinstance(samples,list):samples=[]; self.hunt_activity_history[sid]=samples
+            if samples and int((samples[-1] or {}).get('t',0) or 0)==ts:continue
+            samples.append({'t':ts,'npc':int(rec.get('npc_kills',0) or 0),'ships':int(rec.get('ship_kills',0) or 0),'pods':int(rec.get('pod_kills',0) or 0),'jumps':int(rec.get('ship_jumps',0) or 0)})
+            self.hunt_activity_history[sid]=samples[-12:]; touched=True
+        # Prune systems not sampled for two weeks so the history file stays small.
+        cutoff=now-14*86400
+        for sid in list(self.hunt_activity_history):
+            samples=self.hunt_activity_history.get(sid,[])
+            if not samples or int((samples[-1] or {}).get('t',0) or 0)<cutoff:self.hunt_activity_history.pop(sid,None); touched=True
+        if touched:save_hunting_activity_history(self.hunt_activity_history)
+
+    def _hunt_trend(self,system_id,current):
+        samples=self.hunt_activity_history.get(str(int(system_id)),[])
+        if not isinstance(samples,list) or len(samples)<2:return 'NEW',0.0
+        prev=samples[-2] if int((samples[-1] or {}).get('t',0) or 0)==int(self.hunting_data.get('fetched_at',0) or 0) else samples[-1]
+        def sig(r):return float(r.get('npc',r.get('npc_kills',0)) or 0)+float(r.get('ships',r.get('ship_kills',0)) or 0)*28+float(r.get('pods',r.get('pod_kills',0)) or 0)*42+min(float(r.get('jumps',r.get('ship_jumps',0)) or 0),500)*0.10
+        delta=sig(current)-sig(prev); base=max(25.0,sig(prev)); pct=delta/base
+        if pct>=0.30 or delta>=120:return '▲ HEATING',delta
+        if pct<=-0.30 or delta<=-120:return '▼ COOLING',delta
+        return '→ STEADY',delta
+
+    def _hunt_zkill_cached_summary(self,system_id):
+        rec=self.hunt_zkill_cache.get(str(int(system_id)),{})
+        if not isinstance(rec,dict):return None
+        try:age=int(time.time())-int(rec.get('fetched_at',0) or 0)
+        except Exception:return None
+        if age>7*86400:return None
+        sm=rec.get('summary')
+        return sm if isinstance(sm,dict) else None
+
+    def _hunt_blops_info(self,origin,node):
+        sh=SHIPS.get(self.ship.get(),{}); result={'eligible':False,'distance':None,'fuel':None,'legal':False,'text':'—'}
+        if str(sh.get('class',''))!='Black Ops' or not origin or not node:return result
+        d=distance_ly(origin,node); maxr=float(sh.get('range',0))*(1+0.2*self.jdc.get()); result['distance']=d; result['eligible']=d<=maxr+1e-9
+        if result['eligible']:
+            o_ok,_=origin_legality(origin,sh); d_ok,_,_=destination_legality(node,sh,self.incursion_systems,self.use_live_rules.get()); result['legal']=bool(o_ok and d_ok)
+            result['fuel']=calc_fuel(d,sh,self.jfc.get(),0); result['text']=f'{d:.1f} LY ✓' if result['legal'] else f'{d:.1f} LY !'
+        else:result['text']=f'{d:.1f} LY ✗'
+        return result
+
+    def _hunt_blops_staging(self,target,limit=3):
+        origin=system(self.hunt_origin.get().strip()); sh=SHIPS.get(self.ship.get(),{})
+        if not origin or not target or str(sh.get('class',''))!='Black Ops':return []
+        maxr=float(sh.get('range',0))*(1+0.2*self.jdc.get()); _o,near=gate_neighborhood(origin[1],5); out=[]
+        for node,hops in near:
+            if int(node[8] or 0)<=0:continue
+            d=distance_ly(node,target)
+            if d>maxr+1e-9:continue
+            ok1,_=origin_legality(node,sh); ok2,_,_=destination_legality(target,sh,self.incursion_systems,self.use_live_rules.get())
+            if ok1 and ok2:out.append((hops,d,node))
+        out.sort(key=lambda x:(x[0],x[1],x[2][1].casefold()))
+        return out[:limit]
+
+    def _hunt_escape_summary(self,node,max_hops=45):
+        """Find the nearest low-sec and high-sec exits on the SDE gate graph."""
+        if not node:return 'Unknown'
+        nodes,adj=gate_graph_snapshot(); dist,_parent=gate_distances(int(node[0]),max_hops=max_hops,adj=adj)
+        nearest_low=None; nearest_high=None
+        for sid,hops in dist.items():
+            if sid==int(node[0]) or sid not in nodes:continue
+            band=security_band(nodes[sid][5]); item=(hops,nodes[sid][1])
+            if band=='Low-sec' and (nearest_low is None or item<nearest_low):nearest_low=item
+            elif band=='High-sec' and (nearest_high is None or item<nearest_high):nearest_high=item
+        bits=[]
+        if nearest_low:bits.append(f'nearest low-sec {nearest_low[1]} ({nearest_low[0]} gates)')
+        if nearest_high:bits.append(f'nearest high-sec {nearest_high[1]} ({nearest_high[0]} gates)')
+        return ' • '.join(bits) if bits else f'No low/high-sec exit found within {max_hops} gates'
 
     def scan_hunting_area(self,use_cached=False):
         origin_name=self.hunt_origin.get().strip(); origin=system(origin_name)
@@ -4013,7 +4440,8 @@ class App(tk.Tk):
         origin,nearby=gate_neighborhood(origin_name,max_hops)
         systems_data=self.hunting_data.get('systems',{}) if isinstance(self.hunting_data,dict) else {}
         sov_data=self.hunting_data.get('sovereignty',{}) if isinstance(self.hunting_data,dict) else {}
-        mode=self.hunt_mode.get(); sec_mode=self.hunt_security.get(); min_npc=max(0,int(self.hunt_min_npc.get() or 0)); rows=[]
+        self._hunt_record_activity_history(nearby,systems_data,self.hunting_data.get('fetched_at'))
+        _nodes,adj=gate_graph_snapshot(); mode=self.hunt_mode.get(); sec_mode=self.hunt_security.get(); min_npc=max(0,int(self.hunt_min_npc.get() or 0)); rows=[]
         for node,hops in nearby:
             if int(node[0])==int(origin[0]):continue
             sec=float(node[5]); band=security_band(sec)
@@ -4023,37 +4451,54 @@ class App(tk.Tk):
             npc=int(rec.get('npc_kills',0) or 0); ships=int(rec.get('ship_kills',0) or 0); pods=int(rec.get('pod_kills',0) or 0); traffic=int(rec.get('ship_jumps',0) or 0)
             if npc<min_npc:continue
             sov=sov_data.get(str(node[0]),{}) if isinstance(sov_data,dict) else {}; has_sov=bool(int(sov.get('alliance_id',0) or 0) or int(sov.get('corporation_id',0) or 0))
-            ess_candidate=bool(sec<=0.0 and has_sov)
-            obs=self._ess_observation(node[1]); observed_main=float(obs.get('main_bank',0) or 0)
-            score=hunting_score(mode,rec,sec,has_sov,observed_main)
-            rows.append({'node':node,'hops':hops,'npc':npc,'ships':ships,'pods':pods,'traffic':traffic,'score':score,'ess_candidate':ess_candidate,'has_sov':has_sov,'ess_text':self._ess_text(node[1],ess_candidate)})
-        rows.sort(key=lambda r:(-r['score'],r['hops'],-r['npc'],r['node'][1].casefold()))
-        self.hunt_results=rows
+            ess_candidate=bool(sec<=0.0 and has_sov); obs=self._ess_observation(node[1]); observed_main=float(obs.get('main_bank',0) or 0)
+            score=hunting_score(mode,rec,sec,has_sov,observed_main); trend,trend_delta=self._hunt_trend(node[0],rec); topology,exits=hunt_topology(node[0],adj); manual=self._hunt_active_manual_intel(node[1]); zsum=self._hunt_zkill_cached_summary(node[0]); blops=self._hunt_blops_info(origin,node)
+            if trend.startswith('▲'):score=min(999,score+min(90,int(max(0,trend_delta)*0.12)))
+            elif trend.startswith('▼'):score=max(0,score-min(45,int(abs(min(0,trend_delta))*0.07)))
+            if manual:
+                tag=str(manual.get('tag','')).casefold()
+                if tag not in ('empty','clear'):score=min(999,score+45)
+                else:score=max(0,score-80)
+            if zsum:
+                if zsum.get('classification') in ('Ratter losses','Mining losses'):score=min(999,score+65)
+                elif zsum.get('classification')=='Gang / camp activity' and mode in ('Ratter Hunt','ESS Hunt','Blops Hunt'):score=max(0,score-35)
+            if mode=='Blops Hunt':
+                if str(SHIPS.get(self.ship.get(),{}).get('class',''))=='Black Ops' and not (blops['eligible'] and blops['legal']):continue
+                if blops['eligible'] and blops['legal']:score=min(999,score+90)
+            rows.append({'node':node,'hops':hops,'npc':npc,'ships':ships,'pods':pods,'traffic':traffic,'score':score,'trend':trend,'trend_delta':trend_delta,'topology':topology,'exits':exits,'ess_candidate':ess_candidate,'has_sov':has_sov,'sov':sov,'ess_text':self._ess_text(node[1],ess_candidate),'manual':manual,'manual_text':self._hunt_manual_text(node[1]),'zkill':zsum,'blops':blops})
+        rows.sort(key=lambda r:(-r['score'],r['hops'],-r['npc'],r['node'][1].casefold())); self.hunt_results=rows
         if self.hunt_tree is not None:
             self.hunt_tree.delete(*self.hunt_tree.get_children())
             for i,r in enumerate(rows,1):
                 n=r['node']; tags=()
+                if r['trend'].startswith('▲'):tags=('rising',)
                 if r['ess_candidate'] and mode=='ESS Hunt':tags=('ess',)
                 elif r['ships']+r['pods']>=5:tags=('danger',)
                 elif r['npc']>=250:tags=('hot',)
-                self.hunt_tree.insert('', 'end', iid=str(n[0]), values=(i,n[1],n[7],r['hops'],f'{float(n[5]):.2f}',r['traffic'],r['npc'],r['ships'],r['pods'],r['score'],r['ess_text'],'YES' if r['has_sov'] else '—'),tags=tags)
+                ztext=(r['zkill'] or {}).get('classification','—') if r.get('zkill') else '—'
+                self.hunt_tree.insert('', 'end', iid=str(n[0]), values=(i,n[1],n[7],r['hops'],f'{float(n[5]):.2f}',r['trend'],r['traffic'],r['npc'],r['ships'],r['pods'],r['score'],f"{r['topology']} ({r['exits']})",r['manual_text'],r['ess_text'],ztext,r['blops']['text']),tags=tags)
         self.hunt_metric_systems.set(f'{len(rows):,}\nwithin {max_hops} hops')
-        rat=max(rows,key=lambda r:r['npc'],default=None); pvp=max(rows,key=lambda r:(r['ships']*2+r['pods']*3),default=None)
-        ess=max((r for r in rows if r['ess_candidate']),key=lambda r:(float(self._ess_observation(r['node'][1]).get('main_bank',0) or 0),r['npc'],r['score']),default=None)
-        self.hunt_metric_ratting.set(f"{rat['node'][1]}\n{rat['npc']:,} NPC kills/h" if rat and rat['npc'] else 'No signal')
-        self.hunt_metric_pvp.set(f"{pvp['node'][1]}\n{pvp['ships']} ship • {pvp['pods']} pod" if pvp and (pvp['ships'] or pvp['pods']) else 'No signal')
-        self.hunt_metric_ess.set(f"{ess['node'][1]}\n{ess['ess_text']}" if ess else 'No sov-null target')
-        age=self._hunting_cache_age(); stamp=f'{age//60}m old' if age is not None else 'no timestamp'
-        sov_note='Sovereignty feed unavailable; ESS potential disabled. ' if self.hunting_data.get('sovereignty_error') else ''
-        self.hunt_status.set(f'{mode} scan from {origin[1]} • {len(rows):,} candidate systems • CCP last-hour activity cache {stamp}. {sov_note}Traffic is jumps/hour; it is not an exact pilot count. ESS “Potential” means sovereign nullsec + ratting signal, not a public bank balance.')
+        rat=max(rows,key=lambda r:r['npc'],default=None); pvp=max(rows,key=lambda r:(r['ships']*2+r['pods']*3),default=None); ess=max((r for r in rows if r['ess_candidate']),key=lambda r:(float(self._ess_observation(r['node'][1]).get('main_bank',0) or 0),r['npc'],r['score']),default=None)
+        self.hunt_metric_ratting.set(f"{rat['node'][1]}\n{rat['npc']:,} NPC kills/h" if rat and rat['npc'] else 'No signal'); self.hunt_metric_pvp.set(f"{pvp['node'][1]}\n{pvp['ships']} ship • {pvp['pods']} pod" if pvp and (pvp['ships'] or pvp['pods']) else 'No signal'); self.hunt_metric_ess.set(f"{ess['node'][1]}\n{ess['ess_text']}" if ess else 'No sov-null target')
+        age=self._hunting_cache_age(); stamp=f'{age//60}m old' if age is not None else 'no timestamp'; sov_note='Sovereignty feed unavailable; ESS potential disabled. ' if self.hunting_data.get('sovereignty_error') else ''
+        blops_note=' Blops Hunt uses the currently selected hull/JDC/JFC; select a Black Ops hull to enable range filtering.' if mode=='Blops Hunt' else ''
+        self.hunt_status.set(f'{mode} scan from {origin[1]} • {len(rows):,} candidates • CCP cache {stamp}. {sov_note}Trend compares locally saved public snapshots; topology is based on the SDE gate graph.{blops_note}')
+        self.redraw_hunting_map(); self.hunt_update_dossier()
 
     def hunt_tree_context_menu(self,event):
         if self.hunt_tree is None:return
         iid=self.hunt_tree.identify_row(event.y)
         if not iid:return
-        self.hunt_tree.selection_set(iid); self.hunt_tree.focus(iid)
-        vals=self.hunt_tree.item(iid,'values')
-        if vals:self.show_system_context_menu(event,str(vals[1]))
+        self.hunt_tree.selection_set(iid); self.hunt_tree.focus(iid); vals=self.hunt_tree.item(iid,'values')
+        if not vals:return
+        name=str(vals[1]); menu=tk.Menu(self,tearoff=False); menu.add_command(label='Set Destination in EVE',command=self.hunt_set_selected_destination); menu.add_command(label='Use as New Origin',command=self.hunt_use_selected_origin); menu.add_separator(); menu.add_command(label='Add / Update Manual Intel',command=self.hunt_add_manual_intel); menu.add_command(label='Clear Manual Intel',command=self.hunt_clear_manual_intel); menu.add_command(label='Mark Visited',command=self.hunt_mark_visited); menu.add_command(label='Fetch zKill History',command=self.hunt_fetch_selected_zkill); menu.add_command(label='Record Observed ESS',command=self.hunt_record_selected_ess); menu.add_command(label='Plan Blops Jump',command=self.hunt_plan_blops); menu.add_separator(); menu.add_command(label='More System Actions…',command=lambda:self._show_system_context_menu_at_pointer(name))
+        try:menu.tk_popup(event.x_root,event.y_root)
+        finally:menu.grab_release()
+
+    def _show_system_context_menu_at_pointer(self,name):
+        # Reuse the application's standard system menu without needing the original event.
+        class E:pass
+        e=E(); e.x_root=self.winfo_pointerx(); e.y_root=self.winfo_pointery(); self.show_system_context_menu(e,name)
 
     def hunt_set_selected_destination(self):
         name=self._hunt_selected_system()
@@ -4063,6 +4508,35 @@ class App(tk.Tk):
         name=self._hunt_selected_system()
         if not name:return
         self.hunt_origin.set(name); self.scan_hunting_area(use_cached=True)
+
+    def hunt_add_manual_intel(self):
+        name=self._hunt_selected_system()
+        if not name:return
+        old=self._hunt_active_manual_intel(name); prompt='Intel tag (examples: Ishtar seen, Marauders, Gate camp, Cyno active, Empty, ESS):'
+        tag=simpledialog.askstring('Manual hunting intel',prompt,initialvalue=str(old.get('tag','')) or None,parent=self)
+        if tag is None:return
+        tag=tag.strip()
+        if not tag:return
+        note=simpledialog.askstring('Manual hunting intel',f'Optional note for {name}:',initialvalue=str(old.get('note','')) or None,parent=self)
+        hours=simpledialog.askinteger('Intel expiry',f'Expire this intel after how many hours?\n\nUse 1–168 hours.',initialvalue=max(1,int((int(old.get('expires_at',0) or 0)-int(time.time()))/3600)) if old else 2,minvalue=1,maxvalue=168,parent=self)
+        if hours is None:return
+        self.hunt_manual_intel[name.casefold()]={'system':name,'tag':tag,'note':str(note or '').strip(),'observed_at':int(time.time()),'expires_at':int(time.time())+hours*3600}
+        self.config['hunt_manual_intel']=self.hunt_manual_intel; save_config(self.config); self.scan_hunting_area(use_cached=True)
+
+    def hunt_clear_manual_intel(self):
+        name=self._hunt_selected_system()
+        if not name:return
+        self.hunt_manual_intel.pop(name.casefold(),None); self.config['hunt_manual_intel']=self.hunt_manual_intel; save_config(self.config); self.scan_hunting_area(use_cached=True)
+
+    def hunt_mark_visited(self):
+        name=self._hunt_selected_system()
+        if not name:return
+        rec=self.hunt_visit_history.get(name.casefold(),{}) if isinstance(self.hunt_visit_history.get(name.casefold(),{}),dict) else {}
+        note=simpledialog.askstring('Mark hunting visit',f'Optional result/note for {name}:\nExamples: empty, Ishtar escaped, good targets, camped',initialvalue=str(rec.get('note','')) or None,parent=self)
+        if note is None:return
+        row=self._hunt_result(name) or {}
+        self.hunt_visit_history[name.casefold()]={'system':name,'last_visited':int(time.time()),'visits':int(rec.get('visits',0) or 0)+1,'note':str(note or '').strip(),'score':int(row.get('score',0) or 0),'npc':int(row.get('npc',0) or 0),'ships':int(row.get('ships',0) or 0),'pods':int(row.get('pods',0) or 0)}
+        self.config['hunt_visit_history']=self.hunt_visit_history; save_config(self.config); self.hunt_update_dossier()
 
     def hunt_record_selected_ess(self):
         name=self._hunt_selected_system()
@@ -4079,6 +4553,201 @@ class App(tk.Tk):
         name=self._hunt_selected_system()
         if not name:return
         self.ess_observations.pop(name.casefold(),None); self.config['ess_observations']=self.ess_observations; save_config(self.config); self.scan_hunting_area(use_cached=True)
+
+    def hunt_fetch_selected_zkill(self):
+        name=self._hunt_selected_system(); row=self._hunt_result(name)
+        if not name or not row:return
+        if self.hunt_zkill_running:return
+        sid=str(int(row['node'][0])); cached=self.hunt_zkill_cache.get(sid,{}) if isinstance(self.hunt_zkill_cache.get(sid,{}),dict) else {}
+        age=int(time.time())-int(cached.get('fetched_at',0) or 0) if cached.get('fetched_at') else 10**9
+        if age<3600 and isinstance(cached.get('summary'),dict):
+            self.hunt_status.set(f'zKill context for {name} is cached for one hour ({max(1,(3600-age)//60)}m until refresh).'); self.hunt_update_dossier(); return
+        self.hunt_zkill_running=True; self.hunt_status.set(f'Fetching up to seven days of public zKill history for {name}…')
+        def work():
+            try:
+                kills=fetch_zkill_system(int(sid),604800); summary=summarize_zkill_kills(kills); payload={'fetched_at':int(time.time()),'summary':summary}; self.after(0,lambda:self._finish_hunt_zkill(name,sid,payload,None))
+            except Exception as e:self.after(0,lambda msg=str(e):self._finish_hunt_zkill(name,sid,None,msg))
+        threading.Thread(target=work,daemon=True).start()
+
+    def _finish_hunt_zkill(self,name,sid,payload,error):
+        self.hunt_zkill_running=False
+        if error:self.hunt_status.set(f'zKill lookup failed for {name}: {error}'); return
+        self.hunt_zkill_cache[str(sid)]=payload or {}
+        cutoff=int(time.time())-30*86400
+        for key in list(self.hunt_zkill_cache):
+            rec=self.hunt_zkill_cache.get(key,{})
+            if not isinstance(rec,dict) or int(rec.get('fetched_at',0) or 0)<cutoff:self.hunt_zkill_cache.pop(key,None)
+        save_zkill_cache(self.hunt_zkill_cache); self.hunt_status.set(f'zKill history cached for {name}. zKill data is historical and not live-local intel.'); self.scan_hunting_area(use_cached=True)
+        try:
+            iid=str(sid)
+            if iid in self.hunt_tree.get_children():self.hunt_tree.selection_set(iid); self.hunt_tree.focus(iid); self.hunt_tree.see(iid)
+        except Exception:pass
+        self.hunt_update_dossier()
+
+    def hunt_update_dossier(self):
+        if not self.hunt_dossier_text:return
+        name=self._hunt_selected_system(); r=self._hunt_result(name)
+        if not r:
+            text='Select a target to open its dossier.'
+        else:
+            n=r['node']; sec=float(n[5]); rec=self.hunt_visit_history.get(name.casefold(),{}) if isinstance(self.hunt_visit_history.get(name.casefold(),{}),dict) else {}; manual=self._hunt_active_manual_intel(name); z=r.get('zkill') or {}; obs=self._ess_observation(name)
+            reasons=[]
+            if r['npc']>=250:reasons.append(f"strong NPC activity ({r['npc']:,}/h)")
+            elif r['npc']>0:reasons.append(f"NPC activity {r['npc']:,}/h")
+            if r['ships'] or r['pods']:reasons.append(f"PvP signal {r['ships']} ship / {r['pods']} pod kills")
+            if r['trend'].startswith('▲'):reasons.append('activity is heating up versus the previous saved snapshot')
+            if r['topology']=='Dead-end':reasons.append('single-exit dead-end')
+            elif r['topology'] in ('Junction','Hub'):reasons.append(f"{r['exits']} gate exits")
+            if r['ess_candidate']:reasons.append('sovereign nullsec ESS potential')
+            if manual:reasons.append('active manual intel: '+str(manual.get('tag','Intel')))
+            if z.get('classification') and z.get('classification')!='No recent zKill signal':reasons.append('zKill: '+str(z.get('classification')))
+            if r['blops'].get('eligible') and r['blops'].get('legal'):reasons.append('inside selected Black Ops jump envelope')
+            visit='Never recorded'
+            if rec.get('last_visited'):
+                age=max(0,int(time.time())-int(rec.get('last_visited') or 0)); visit=(f"{age//86400}d ago" if age>=86400 else f"{age//3600}h ago" if age>=3600 else f"{age//60}m ago")+f" • visits {int(rec.get('visits',0) or 0)}"+(f" • score then {int(rec.get('score',0) or 0)}" if rec.get('score') is not None else '')+(f" • {rec.get('note')}" if rec.get('note') else '')
+            manual_line='None'
+            if manual:
+                left=max(0,int(manual.get('expires_at',0) or 0)-int(time.time())); manual_line=f"{manual.get('tag','Intel')} • expires in {left//3600}h {left%3600//60}m"+(f" • {manual.get('note')}" if manual.get('note') else '')
+            ess_line=self._ess_text(name,r['ess_candidate'])
+            zline='Not fetched for this system'
+            if z:
+                victims=', '.join(f'{nm} ×{cnt}' for nm,cnt in z.get('victims',[])[:4]) or 'none'; attackers=', '.join(f'{nm} ×{cnt}' for nm,cnt in z.get('attackers',[])[:4]) or 'none'; zline=f"{z.get('classification','Recent kills')} • {int(z.get('count',0) or 0)} killmails / 7d • {format_isk_short(z.get('total_value',0))} destroyed • victims: {victims} • attacker hulls: {attackers}"
+            blops='Select a Black Ops hull to calculate.'
+            if str(SHIPS.get(self.ship.get(),{}).get('class',''))=='Black Ops':
+                bi=r['blops']; blops=f"{self.ship.get()} • {bi.get('distance',0):.2f} LY • {'reachable/legal' if bi.get('eligible') and bi.get('legal') else 'outside range or blocked'}"+(f" • {int(bi.get('fuel') or 0):,} isotopes" if bi.get('fuel') else '')
+                stages=self._hunt_blops_staging(n)
+                if stages:blops+=' • staging: '+', '.join(f'{x[2][1]} ({x[1]:.1f} LY)' for x in stages)
+            sov=r.get('sov') or {}; sov_bits=[]
+            if sov.get('alliance_id'):sov_bits.append('Alliance sovereignty detected')
+            if sov.get('corporation_id'):sov_bits.append('Corporation sovereignty detected')
+            if sov.get('faction_id'):sov_bits.append('Faction sovereignty detected')
+            text=(f"{name} — {n[7]}    SEC {sec:.3f} ({security_band(sec)})    {r['hops']} gate hops\n"
+                  f"HUNT SCORE {r['score']}    TREND {r['trend']}    TOPOLOGY {r['topology']} / {r['exits']} exits    NPC STATIONS {int(n[8] or 0)}\n"
+                  f"ACTIVITY  jumps {r['traffic']}/h • NPC kills {r['npc']}/h • ship kills {r['ships']}/h • pod kills {r['pods']}/h\n"
+                  f"SOV / ESS  {', '.join(sov_bits) if sov_bits else 'No sovereignty record'} • {ess_line}\n"
+                  f"ESCAPE / ACCESS  {self._hunt_escape_summary(n)}\n"
+                  f"MANUAL INTEL  {manual_line}\nVISIT HISTORY  {visit}\n"
+                  f"zKILL (HISTORICAL)  {zline}\nBLOPS  {blops}\n"
+                  f"WHY IT RANKED  {'; '.join(reasons) if reasons else 'No strong positive signal beyond the selected profile weights.'}")
+        self.hunt_dossier_text.configure(state='normal'); self.hunt_dossier_text.delete('1.0','end'); self.hunt_dossier_text.insert('1.0',text); self.hunt_dossier_text.configure(state='disabled'); self.redraw_hunting_map()
+
+    def _hunt_map_axes(self,nodes):
+        if len(nodes)<2:return 0,1
+        spans=[]
+        for axis in range(3):
+            vals=[float(n[axis+2]) for n in nodes]; spans.append((max(vals)-min(vals),axis))
+        spans.sort(reverse=True); return spans[0][1],spans[1][1] if len(spans)>1 else 1
+
+    def redraw_hunting_map(self):
+        c=self.hunt_map_canvas
+        if c is None:return
+        try:w=max(c.winfo_width(),480); h=max(c.winfo_height(),280)
+        except Exception:return
+        c.delete('all'); self.hunt_map_hitboxes=[]; origin=system(self.hunt_origin.get().strip())
+        if not origin or not self.hunt_results:
+            c.create_text(w/2,h/2,text='SCAN AN AREA TO INITIALISE HUNTING TELEMETRY',fill='#718899',font=('Segoe UI Semibold',11)); return
+        ranked=list(self.hunt_results[:220]); visible={int(r['node'][0]):r for r in ranked}; visible[int(origin[0])]={'node':origin,'score':0,'trend':'ORIGIN'}; nodes=[x['node'] for x in visible.values()]; ax,ay=self._hunt_map_axes(nodes)
+        xs=[float(n[ax+2]) for n in nodes]; ys=[float(n[ay+2]) for n in nodes]; xmin,xmax=min(xs),max(xs); ymin,ymax=min(ys),max(ys); dx=max(xmax-xmin,1); dy=max(ymax-ymin,1); pad=34; scale=min(max(20,w-2*pad)/dx,max(20,h-2*pad)/dy); cx=(xmin+xmax)/2; cy=(ymin+ymax)/2
+        pos={int(n[0]):(w/2+(float(n[ax+2])-cx)*scale,h/2-(float(n[ay+2])-cy)*scale) for n in nodes}
+        for gx in range(0,int(w)+1,64):c.create_line(gx,0,gx,h,fill='#0d1b25')
+        for gy in range(0,int(h)+1,64):c.create_line(0,gy,w,gy,fill='#0d1b25')
+        _gn,adj=gate_graph_snapshot()
+        done=set()
+        for a in pos:
+            for b in adj.get(a,()):
+                if b not in pos:continue
+                key=tuple(sorted((a,b)))
+                if key in done:continue
+                done.add(key); c.create_line(*pos[a],*pos[b],fill='#173041',width=1)
+        selected=self._hunt_selected_system().casefold()
+        maxscore=max(1,max([int(r.get('score',0) or 0) for r in ranked] or [1]))
+        for sid,r in visible.items():
+            n=r['node']; x,y=pos[sid]; is_origin=(sid==int(origin[0])); sel=(str(n[1]).casefold()==selected); score=int(r.get('score',0) or 0)
+            if is_origin:fill='#7ce8ff'; radius=7
+            elif r.get('ess_candidate') and self.hunt_mode.get()=='ESS Hunt':fill='#e0ba55'; radius=4+min(4,int(score/maxscore*4))
+            elif r.get('trend','').startswith('▲'):fill='#4bc0e8'; radius=4+min(4,int(score/maxscore*4))
+            elif int(r.get('ships',0))+int(r.get('pods',0))>=5:fill='#d76066'; radius=4+min(4,int(score/maxscore*4))
+            else:fill='#7b93a3'; radius=3+min(4,int(score/maxscore*4))
+            c.create_oval(x-radius,y-radius,x+radius,y+radius,fill=fill,outline='#ffffff' if sel else '#0b1118',width=2 if sel else 1); self.hunt_map_hitboxes.append((x,y,max(10,radius+5),sid))
+            if is_origin or sel or (not is_origin and score>=maxscore*0.72 and len(ranked)<=120):c.create_text(x+8,y-7,text=n[1],anchor='sw',fill='#d9e6ee',font=('Segoe UI',8,'bold' if sel or is_origin else 'normal'))
+        c.create_text(10,10,anchor='nw',text=f'{len(ranked)} highest-ranked systems • gate links • SDE spatial projection',fill='#7893a5',font=('Segoe UI',8))
+
+    def hunt_map_click(self,event):
+        best=None
+        for x,y,r,sid in self.hunt_map_hitboxes:
+            d=(event.x-x)**2+(event.y-y)**2
+            if d<=r*r and (best is None or d<best[0]):best=(d,sid)
+        if not best:return
+        iid=str(best[1])
+        if self.hunt_tree is not None and iid in self.hunt_tree.get_children():self.hunt_tree.selection_set(iid); self.hunt_tree.focus(iid); self.hunt_tree.see(iid); self.hunt_update_dossier()
+
+    def hunt_build_roam_route(self):
+        origin=system(self.hunt_origin.get().strip())
+        if not origin or not self.hunt_results:
+            messagebox.showinfo('Hunting roam','Scan a hunting area first.',parent=self); return
+        try:target=max(5,min(60,int(self.hunt_roam_jumps.get())))
+        except Exception:target=15; self.hunt_roam_jumps.set(15)
+        nodes,adj=gate_graph_snapshot(); score_by={int(r['node'][0]):r for r in self.hunt_results}; candidates=set(score_by); route=[int(origin[0])]; target_seen=set(); used_edges=set(); current=int(origin[0])
+        while len(route)-1<target and candidates-target_seen:
+            dist,parent=gate_distances(current,max_hops=min(30,target-(len(route)-1)+10),adj=adj); best=None
+            for sid in candidates-target_seen:
+                d=dist.get(sid)
+                if d is None or d<=0:continue
+                path=gate_path_from_parent(parent,sid)
+                if not path:continue
+                remaining=target-(len(route)-1)
+                if d>remaining and best is not None:continue
+                repeat_edges=sum(1 for a,b in zip(path,path[1:]) if tuple(sorted((a,b))) in used_edges); repeat_nodes=sum(1 for x in path[1:] if x in route); r=score_by[sid]
+                utility=float(r['score'])/(1+d*0.55)-repeat_edges*38-repeat_nodes*10
+                if r.get('trend','').startswith('▲'):utility+=30
+                if r.get('manual'):utility+=20
+                if best is None or utility>best[0]:best=(utility,sid,path)
+            if best is None:break
+            _u,sid,path=best; target_seen.add(sid)
+            for nxt in path[1:]:
+                if len(route)-1>=target:break
+                used_edges.add(tuple(sorted((route[-1],nxt)))); route.append(nxt)
+            current=route[-1]
+        self.hunt_roam_nodes=[nodes[i] for i in route if i in nodes]
+        if self.hunt_roam_tree is not None:
+            self.hunt_roam_tree.delete(*self.hunt_roam_tree.get_children())
+            for i,n in enumerate(self.hunt_roam_nodes):
+                r=score_by.get(int(n[0])); signal='Origin' if i==0 else (f"{r['trend']} • {r['npc']} NPC/h • {r['ships']} ship/h" if r else 'Transit system'); self.hunt_roam_tree.insert('', 'end',values=(i,n[1],n[7],f'{float(n[5]):.2f}',r['score'] if r else '—',signal))
+        targets=sum(1 for n in self.hunt_roam_nodes[1:] if int(n[0]) in score_by and score_by[int(n[0])]['score']>0); self.hunt_roam_status.set(f'{max(0,len(self.hunt_roam_nodes)-1)} gate jumps • {targets} scored systems • repeated gates penalised')
+
+    def hunt_copy_roam(self):
+        if len(self.hunt_roam_nodes)<2:self.hunt_build_roam_route()
+        if len(self.hunt_roam_nodes)<2:return
+        text='\n'.join(n[1] for n in self.hunt_roam_nodes); self.clipboard_clear(); self.clipboard_append(text); self.hunt_roam_status.set(f'Copied {len(self.hunt_roam_nodes)} route systems to clipboard.')
+
+    def hunt_send_roam_to_eve(self):
+        if len(self.hunt_roam_nodes)<2:self.hunt_build_roam_route()
+        if len(self.hunt_roam_nodes)<2:return
+        cid=int(self.esi_character_id or 0); rec=self._sso_characters().get(str(cid),{}) if cid else {}; scopes=set(rec.get('scopes',[]) if isinstance(rec.get('scopes',[]),list) else [])
+        if not cid or ESI_WAYPOINT_SCOPE not in scopes:
+            messagebox.showinfo('Permission required','Select a connected character with the EVE waypoint permission.',parent=self); self.tabs.select(self.character_tab); return
+        route=list(self.hunt_roam_nodes[1:60]); char_name=str(rec.get('character_name') or f'Character {cid}')
+        if self.in_game_action_running:return
+        self.in_game_action_running=True; self.hunt_roam_status.set(f'Sending {len(route)} roam waypoints to EVE…')
+        def work():
+            try:
+                access,fresh=self._access_token_for_character(cid,ESI_WAYPOINT_SCOPE)
+                for i,node in enumerate(route):post_autopilot_waypoint(int(node[0]),access,clear_other_waypoints=(i==0),add_to_beginning=False)
+                self.after(0,lambda:self._finish_hunt_roam_send(str(fresh.get('character_name') or char_name),len(route),None))
+            except Exception as e:self.after(0,lambda msg=str(e):self._finish_hunt_roam_send(char_name,len(route),msg))
+        threading.Thread(target=work,daemon=True).start()
+
+    def _finish_hunt_roam_send(self,char_name,count,error):
+        self.in_game_action_running=False
+        if error:self.hunt_roam_status.set('Could not send roam route.'); messagebox.showerror('Hunting roam',error,parent=self); return
+        self.hunt_roam_status.set(f'Sent {count} gate-route waypoint(s) to EVE for {char_name}.')
+
+    def hunt_plan_blops(self):
+        name=self._hunt_selected_system(); origin=self.hunt_origin.get().strip()
+        if not name or not system(origin):return
+        if str(SHIPS.get(self.ship.get(),{}).get('class',''))!='Black Ops':
+            messagebox.showinfo('Blops planning','Select a Black Ops hull (Redeemer, Widow, Sin, Panther or Marshal) in the main ship selector first.',parent=self); return
+        self.frm.set(origin); self.to.set(name); self.tabs.select(self.jump_tab); self.calculate()
 
     # -------------------- v3 Capital Operations --------------------
     def _get_active_operation(self):
@@ -4485,7 +5154,7 @@ class App(tk.Tk):
 
     def startup(self):
         migrate_windows_branding_shortcuts()
-        m=load_meta(); self.status.set(f"SDE build: {m.get('sde_build','not installed')} • {m.get('system_count',0):,} systems • {int(m.get('npc_station_count',0) or 0):,} NPC stations • {int(m.get('stargate_connection_count',0) or 0):,} stargate links")
+        m=load_meta(); self.status.set(f"SDE build: {m.get('sde_build','not installed')} • {m.get('system_count',0):,} navigation systems • {int(m.get('universe_system_count',m.get('system_count',0)) or 0):,} named systems • {int(m.get('npc_station_count',0) or 0):,} NPC stations • {int(m.get('stargate_connection_count',0) or 0):,} stargate links")
         if not database_schema_ready():
             self.write('EVE data needs the current resilient type-name + skill-prerequisite database.\n\nThe planner will now rebuild from the current official CCP Static Data Export. This rebuild imports item/ship/skill names from the CCP SDE and repairs any missing names from CCP ESI without blocking the navigation database.')
             self.do_update()
@@ -4543,7 +5212,7 @@ class App(tk.Tk):
         except tk.TclError:pass
 
     def on_close(self):
-        self.config['app_state']={'ship':self.ship.get(),'jdc':self.jdc.get(),'jfc':self.jfc.get(),'jf':self.jf.get(),'range_station_filter':self.range_station_filter.get(),'route_station_policy':self.route_station_policy.get(),'route_require_dest_station':bool(self.route_require_dest_station.get()),'hunt_origin':self.hunt_origin.get().strip(),'hunt_max_hops':int(self.hunt_max_hops.get() or 10),'hunt_security':self.hunt_security.get(),'hunt_mode':self.hunt_mode.get(),'hunt_min_npc':int(self.hunt_min_npc.get() or 0)}
+        self.config['app_state']={'ship':self.ship.get(),'jdc':self.jdc.get(),'jfc':self.jfc.get(),'jf':self.jf.get(),'range_station_filter':self.range_station_filter.get(),'route_station_policy':self.route_station_policy.get(),'route_require_dest_station':bool(self.route_require_dest_station.get()),'hunt_origin':self.hunt_origin.get().strip(),'hunt_max_hops':int(self.hunt_max_hops.get() or 10),'hunt_security':self.hunt_security.get(),'hunt_mode':self.hunt_mode.get(),'hunt_min_npc':int(self.hunt_min_npc.get() or 0),'hunt_roam_jumps':int(self.hunt_roam_jumps.get() or 15)}
         self.config['fuel_prices']={iso:self._clean_price_var(var.get()) for iso,var in self.fuel_price_vars.items() if self._clean_price_var(var.get()) is not None}
         self.config['update_feed_url']=self.update_feed_url.get().strip()
         self.config['favorite_systems']=list(self.favorite_systems)
@@ -4553,6 +5222,9 @@ class App(tk.Tk):
         self.config['activity_cache']=self.activity_data
         self.config['hunting_cache']=self.hunting_data
         self.config['ess_observations']=self.ess_observations
+        self.config['hunt_manual_intel']=self.hunt_manual_intel
+        self.config['hunt_visit_history']=self.hunt_visit_history
+        save_hunting_activity_history(self.hunt_activity_history); save_zkill_cache(self.hunt_zkill_cache)
         sso=self.config.setdefault('esi_sso',{})
         sso['auto_apply']=bool(self.esi_auto_apply.get())
         sso['active_character_id']=int(self.esi_character_id or 0)

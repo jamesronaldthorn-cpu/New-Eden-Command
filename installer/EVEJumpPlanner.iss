@@ -1,6 +1,6 @@
 #define MyAppName "New Eden Command"
 #ifndef MyAppVersion
-  #define MyAppVersion "3.4.6"
+  #define MyAppVersion "3.5.1"
 #endif
 #define MyAppExeName "EVE Jump Planner.exe"
 

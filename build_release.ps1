@@ -312,4 +312,4 @@ Write-Host ''
 Write-Host 'Online updater:' -ForegroundColor Cyan
 Write-Host '  Host the four release files together over HTTPS.'
 Write-Host '  For GitHub Releases, use this feed URL in the app:'
-Write-Host '  https://github.com/OWNER/REPO/releases/latest/download/latest.json'
+Write-Host '  https://github.com/jamesronaldthorn-cpu/New-Eden-Command/releases/latest/download/latest.json'
