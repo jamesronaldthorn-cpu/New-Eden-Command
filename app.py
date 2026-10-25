@@ -15,8 +15,8 @@ if os.name=='nt':
         except Exception: pass
 
 APP_NAME='New Eden Command'
-VERSION='3.5.1'
-SDE_SCHEMA_VERSION=9
+VERSION='3.5.2'
+SDE_SCHEMA_VERSION=10
 APP_ID='eve-jump-planner'
 UPDATE_FORMAT=2
 UPDATE_EXTENSION='.ejpupdate'
@@ -1041,10 +1041,42 @@ def latest_build():
             if x.get('_key')=='sde': return str(x.get('_value') or x.get('buildNumber') or x.get('value'))
     raise RuntimeError('Could not read CCP SDE build number')
 
-def locate_member(z, suffix):
-    for n in z.namelist():
-        if n.endswith(suffix): return n
-    raise RuntimeError(f'{suffix} not found in SDE')
+def locate_member(z, filename):
+    """Return the ZIP member whose *basename* exactly matches filename.
+
+    The SDE contains several dataset names that can end with another dataset
+    name.  The old `endswith()` lookup could therefore select a similarly
+    named JSONL file instead of (for example) the real `types.jsonl`.  That
+    produced a valid-looking import with zero type names and left only the
+    three emergency seed rows.
+    """
+    wanted=str(filename).replace('\\','/').rsplit('/',1)[-1].casefold()
+    members=[n for n in z.namelist() if n and not n.endswith('/')]
+    exact=[n for n in members if n.replace('\\','/').rsplit('/',1)[-1].casefold()==wanted]
+    if exact:
+        # Prefer the shallowest/shortest path if an archive ever contains a
+        # duplicate basename.  Current CCP archives normally have one.
+        return min(exact,key=lambda n:(n.replace('\\','/').count('/'),len(n),n.casefold()))
+    near=[n for n in members if wanted in n.replace('\\','/').rsplit('/',1)[-1].casefold()]
+    hint=(f" Similar members: {', '.join(near[:5])}" if near else '')
+    raise RuntimeError(f'{filename} not found in SDE.'+hint)
+
+def _sde_record_object(row):
+    """Normalize a streamed SDE JSONL record to its object payload.
+
+    CCP's current integer-keyed object datasets expose fields beside `_key`.
+    This also accepts a defensive `_value` object wrapper so a future exporter
+    variation cannot silently turn the name index into an empty table.
+    """
+    if not isinstance(row,dict):
+        return {}
+    value=row.get('_value')
+    if isinstance(value,dict):
+        merged=dict(value)
+        if '_key' not in merged and row.get('_key') is not None:
+            merged['_key']=row.get('_key')
+        return merged
+    return row
 
 def database_schema_ready():
     if not DB.exists(): return False
@@ -1145,23 +1177,37 @@ def update_sde(progress=lambda message,percent=None:None):
 
         progress('Indexing item names for assets and logistics…', 70)
         type_import_error=''
+        type_import_member=''
+        type_rows_seen=0
+        type_rows_named=0
         try:
             tmember=locate_member(z,'types.jsonl')
+            type_import_member=tmember
+            # Never accept a fuzzy match here.  `types.jsonl` is the canonical
+            # CCP inventory-type dataset and should contain tens of thousands
+            # of readable item/ship/skill names.
+            if tmember.replace('\\','/').rsplit('/',1)[-1].casefold()!='types.jsonl':
+                raise RuntimeError(f'Wrong SDE member selected for type names: {tmember}')
             with z.open(tmember) as tfh:
                 trows=[]
                 for raw in tfh:
-                    t=json.loads(raw)
-                    # CCP JSONL uses `_key` for integer-keyed datasets.  Keep a
-                    # compatibility fallback for alternative/older exports.
+                    type_rows_seen+=1
+                    t=_sde_record_object(json.loads(raw))
+                    # CCP JSONL uses `_key` for integer-keyed datasets. Keep
+                    # compatibility fallbacks for older/alternate exports.
                     tid=int(t.get('_key',t.get('typeID',t.get('type_id',0))) or 0)
                     name=t.get('name')
                     if isinstance(name,dict):
-                        name=name.get('en') or name.get('en-us') or name.get('en_US') or next((v for v in name.values() if v),str(tid))
-                    if not tid or not name: continue
+                        name=name.get('en') or name.get('en-us') or name.get('en_US') or next((v for v in name.values() if v),None)
+                    if not tid or not name:
+                        continue
+                    type_rows_named+=1
                     volume=t.get('volume',t.get('packagedVolume'))
                     trows.append((tid,str(name),t.get('groupID',t.get('group_id')),t.get('marketGroupID',t.get('market_group_id')),volume,1 if t.get('published',True) else 0))
                     if len(trows)>=4000:
                         cur.executemany('INSERT OR REPLACE INTO types VALUES(?,?,?,?,?,?)',trows); trows=[]
+                    if type_rows_seen % 10000 == 0:
+                        progress(f'Indexing item names… {type_rows_named:,} names from {type_rows_seen:,} type records',70)
                 if trows: cur.executemany('INSERT OR REPLACE INTO types VALUES(?,?,?,?,?,?)',trows)
         except Exception as e:
             # Map/routing data is still valuable even if CCP's type-name table
@@ -1336,8 +1382,13 @@ def update_sde(progress=lambda message,percent=None:None):
         con.commit(); type_total=int(cur.execute('SELECT COUNT(*) FROM types').fetchone()[0])
         if type_total < 10000:
             detail=str(locals().get('type_import_error','') or '').strip()
+            member=str(locals().get('type_import_member','') or 'not selected')
+            seen=int(locals().get('type_rows_seen',0) or 0)
+            named=int(locals().get('type_rows_named',0) or 0)
+            diagnostic=f' SDE member: {member}; records scanned: {seen:,}; names found: {named:,}.'
             raise RuntimeError('CCP item/type name index is incomplete '
                                f'({type_total:,} names imported). The existing EVE database was not replaced.'+
+                               diagnostic+
                                (f' Import error: {detail}' if detail else ''))
     finally:
         con.close()
@@ -1668,7 +1719,7 @@ def fetch_zkill_system(system_id,past_seconds=604800):
     sid=int(system_id); seconds=max(3600,min(604800,int(past_seconds)//3600*3600))
     url=f'https://zkillboard.com/api/solarSystemID/{sid}/pastSeconds/{seconds}/'
     req=urllib.request.Request(url,headers={
-        'User-Agent':'New Eden Command/3.5.1 (+https://github.com/jamesronaldthorn-cpu/New-Eden-Command)',
+        'User-Agent':f'{APP_NAME}/{VERSION} (+https://github.com/jamesronaldthorn-cpu/New-Eden-Command)',
         'Accept':'application/json','Accept-Encoding':'gzip',
     })
     with urllib.request.urlopen(req,timeout=30) as r:
