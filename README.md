@@ -1,8 +1,8 @@
-# New Eden Command v3.5.2 — SDE Type-Name Import Fix
+# New Eden Command v3.5.3 — Live Skill Queue Import Fix
 
 New Eden Command is a Windows desktop companion for EVE Online capital navigation, character management, logistics, hunting and route planning.
 
-Version **3.5.2** keeps the full Hunting / Roam Command feature set and the v3.5.1 name-resolution improvements, while fixing the SDE importer bug that could select a similarly named JSONL member instead of CCP's canonical `types.jsonl`. That failure produced only the three emergency seed names and correctly triggered the v3.5.1 safety check.
+Version **3.5.3** keeps the v3.5.2 SDE type-name import fix and the full Hunting / Roam Command feature set, while changing Skill Planner so **Refresh + Import Queue** fetches the selected character's current queue directly from CCP ESI instead of relying on an older cached Command Center snapshot.
 
 ## Hunting / Roam Command
 
@@ -152,7 +152,7 @@ The default online update feed is:
 
 https://github.com/jamesronaldthorn-cpu/New-Eden-Command/releases/latest/download/latest.json
 
-## v3.5.2 SDE importer fix
+## v3.5.3 SDE importer fix
 
 - Selects CCP SDE datasets by exact ZIP-member basename instead of a loose suffix match.
 - Guarantees the item-name importer opens the canonical `types.jsonl` dataset.
@@ -161,7 +161,7 @@ https://github.com/jamesronaldthorn-cpu/New-Eden-Command/releases/latest/downloa
 - Keeps the 10,000-name integrity threshold; the safety check is not weakened.
 - Bumps the local SDE schema to force one clean rebuild after upgrading from v3.5.1.
 
-After installing v3.5.2, let **Refresh Data / EVE Data Update** complete. A healthy current SDE import should index tens of thousands of item, ship and skill names rather than three.
+After installing v3.5.3, let **Refresh Data / EVE Data Update** complete. A healthy current SDE import should index tens of thousands of item, ship and skill names rather than three.
 
 ## v3.5.1 name-resolution fixes
 
@@ -184,11 +184,11 @@ cd "E:\eve_jump_planner"
 .\BUILD_RELEASE.bat
 ```
 
-Expected v3.5.2 output:
+Expected v3.5.3 output:
 
-- `New_Eden_Command_Setup_v3.5.2.exe`
-- `New_Eden_Command_Update_v3.5.2.ejpupdate`
+- `New_Eden_Command_Setup_v3.5.3.exe`
+- `New_Eden_Command_Update_v3.5.3.ejpupdate`
 - `latest.json`
 - `SHA256SUMS.txt`
 
-The internal updater identity remains `eve-jump-planner`, the frozen executable remains `EVE Jump Planner.exe`, the Inno Setup AppId is unchanged, and the existing install directory is preserved intentionally so v3.5.2 upgrades existing installations in place. User data remains under `%USERPROFILE%\.eve_jump_planner`.
+The internal updater identity remains `eve-jump-planner`, the frozen executable remains `EVE Jump Planner.exe`, the Inno Setup AppId is unchanged, and the existing install directory is preserved intentionally so v3.5.3 upgrades existing installations in place. User data remains under `%USERPROFILE%\.eve_jump_planner`.

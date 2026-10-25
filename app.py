@@ -15,7 +15,7 @@ if os.name=='nt':
         except Exception: pass
 
 APP_NAME='New Eden Command'
-VERSION='3.5.2'
+VERSION='3.5.3'
 SDE_SCHEMA_VERSION=10
 APP_ID='eve-jump-planner'
 UPDATE_FORMAT=2
@@ -2400,7 +2400,7 @@ class App(tk.Tk):
         self.skillplan_character=tk.StringVar(value='Active character')
         self.skillplan_status=tk.StringVar(value='Import a synced EVE queue, then optimise it shortest-first while preserving prerequisites.')
         self.skillplan_summary=tk.StringVar(value='No queue imported.')
-        self.skillplan_tree=None; self.skillplan_rows=[]; self.skillplan_original=[]
+        self.skillplan_tree=None; self.skillplan_rows=[]; self.skillplan_original=[]; self.skillplan_import_running=False; self.skillplan_import_btn=None
         self.operations=self.config.get('operations',{}) if isinstance(self.config.get('operations',{}),dict) else {}
         self.active_operation_name=str(self.config.get('active_operation','') or '')
         self.operation_name=tk.StringVar(value=self.active_operation_name)
@@ -2715,7 +2715,7 @@ class App(tk.Tk):
         ttk.Label(sp_head,text='SKILL QUEUE PLANNER',style='SectionTitle.TLabel').grid(row=0,column=0,sticky='w')
         ttk.Label(sp_head,text='Shortest training items first — while keeping every CCP skill prerequisite in legal order.',style='SectionSub.TLabel').grid(row=1,column=0,sticky='w')
         sp_actions=ttk.Frame(sp_head); sp_actions.grid(row=0,column=1,rowspan=2,sticky='e')
-        ttk.Button(sp_actions,text='IMPORT CURRENT QUEUE',command=self.skillplan_import,style='Ghost.TButton').pack(side='left')
+        self.skillplan_import_btn=ttk.Button(sp_actions,text='REFRESH + IMPORT QUEUE',command=self.skillplan_import,style='Ghost.TButton'); self.skillplan_import_btn.pack(side='left')
         ttk.Button(sp_actions,text='OPTIMISE SHORTEST-FIRST',command=self.skillplan_optimise,style='Accent.TButton').pack(side='left',padx=(6,0))
         ttk.Button(sp_actions,text='RESET',command=self.skillplan_reset).pack(side='left',padx=(6,0))
 
@@ -4151,18 +4151,88 @@ class App(tk.Tk):
         if problems:self.skillplan_status.set('Dependency warning: one or more prerequisites are not trained or are later in the plan.')
         elif self.skillplan_rows:self.skillplan_status.set('Plan is dependency-valid against synced trained skills and CCP SDE prerequisites.')
 
-    def skillplan_import(self):
-        self._skillplan_refresh_character_combo(); cid=self._skillplan_selected_cid(); snap=self._snapshot_for(cid)
-        queue=snap.get('skillqueue') if isinstance(snap,dict) else None
-        if queue is None:
-            messagebox.showinfo('Skill Queue Planner','Sync this character in Command Center first. The character also needs the skill queue and skills permissions.',parent=self);return
+    def _skillplan_finish_live_import(self,cid,queue,skills_full=None):
+        """Persist and render a freshly fetched ESI skill queue."""
+        self.skillplan_import_running=False
+        if self.skillplan_import_btn is not None:
+            try:self.skillplan_import_btn.config(state='normal')
+            except Exception:pass
+        try:
+            # Keep the Command Center cache aligned with what the planner just fetched.
+            cache=self._companion_cache(); snap=dict(cache.get(str(int(cid)),{}) or {})
+            snap['character_id']=int(cid); snap['skillqueue']=[dict(q) for q in (queue or []) if isinstance(q,dict)]
+            if isinstance(skills_full,dict):snap['skills_full']=skills_full
+            snap['fetched_at']=int(time.time()); cache[str(int(cid))]=snap
+            save_config(self.config)
+        except Exception:pass
         try:ensure_type_names([q.get('skill_id') for q in queue or [] if isinstance(q,dict)])
         except Exception:pass
         self.skillplan_original=[dict(q) for q in (queue or []) if isinstance(q,dict)]
         self.skillplan_original.sort(key=lambda r:int(r.get('queue_position')) if r.get('queue_position') is not None else 999999)
         self.skillplan_rows=[dict(q) for q in self.skillplan_original]
         self._skillplan_render()
-        self.skillplan_status.set('Imported current EVE queue. Optimise to reorder the remaining items shortest-first legally.')
+        if self.skillplan_rows:
+            self.skillplan_status.set(f'Refreshed directly from CCP ESI and imported {len(self.skillplan_rows)} current/future queue item(s).')
+        else:
+            self.skillplan_status.set('CCP ESI reports that this character currently has no queued skills.')
+        self._command_center_snapshot_signature=None
+
+    def _skillplan_live_import_failed(self,message):
+        self.skillplan_import_running=False
+        if self.skillplan_import_btn is not None:
+            try:self.skillplan_import_btn.config(state='normal')
+            except Exception:pass
+        self.skillplan_status.set('Could not refresh the live EVE skill queue.')
+        messagebox.showerror('Skill Queue Planner',str(message),parent=self)
+
+    def skillplan_import(self):
+        """Fetch the selected character's live ESI queue, then import it.
+
+        Older builds imported only the cached Command Center snapshot, so this button
+        could lag behind the in-game queue until a separate character sync occurred.
+        The planner now refreshes the OAuth access token and calls the skillqueue
+        endpoint itself every time the user imports.
+        """
+        if self.skillplan_import_running:return
+        self._skillplan_refresh_character_combo(); cid=self._skillplan_selected_cid()
+        if not cid:
+            messagebox.showinfo('Skill Queue Planner','Connect an EVE character first.',parent=self);return
+        rec=self._sso_characters().get(str(int(cid)),{})
+        scopes=set(rec.get('scopes',[]) if isinstance(rec.get('scopes',[]),list) else [])
+        if ESI_SKILLQUEUE_SCOPE not in scopes:
+            messagebox.showinfo('Skill Queue Planner','This character has not granted the EVE skill queue permission. Open Characters and re-authorize the character.',parent=self);return
+        self.skillplan_import_running=True
+        if self.skillplan_import_btn is not None:
+            try:self.skillplan_import_btn.config(state='disabled')
+            except Exception:pass
+        self.skillplan_status.set('Refreshing the current queue directly from CCP ESI…')
+        def work():
+            try:
+                access,fresh=self._access_token_for_character(cid,ESI_SKILLQUEUE_SCOPE)
+                queue,_=esi_get_json(f'/latest/characters/{int(cid)}/skillqueue/',access,client_name='SkillPlannerLiveQueueClient')
+                if not isinstance(queue,list):raise RuntimeError('CCP ESI returned an unexpected skill queue response.')
+                # ESI normally returns only active/future entries. Drop any completed
+                # rows defensively so "current queue" never resurrects stale history.
+                now=datetime.now(timezone.utc); current=[]
+                for row in queue:
+                    if not isinstance(row,dict):continue
+                    finish=row.get('finish_date')
+                    if finish:
+                        try:
+                            when=datetime.fromisoformat(str(finish).replace('Z','+00:00'))
+                            if when.tzinfo is None:when=when.replace(tzinfo=timezone.utc)
+                            if when<=now:continue
+                        except Exception:pass
+                    current.append(dict(row))
+                skills_full=None
+                fresh_scopes=set(fresh.get('scopes',[]) if isinstance(fresh.get('scopes',[]),list) else [])
+                if ESI_SKILLS_SCOPE in fresh_scopes:
+                    try:skills_full=esi_get_json(f'/v4/characters/{int(cid)}/skills/',access,client_name='SkillPlannerLiveSkillsClient')[0]
+                    except Exception:skills_full=None
+                self.after(0,lambda:self._skillplan_finish_live_import(cid,current,skills_full))
+            except Exception as e:
+                self.after(0,lambda msg=str(e):self._skillplan_live_import_failed(msg))
+        threading.Thread(target=work,daemon=True).start()
 
     def skillplan_reset(self):
         self.skillplan_rows=[dict(q) for q in self.skillplan_original]; self._skillplan_render(); self.skillplan_status.set('Restored the imported EVE queue order.')

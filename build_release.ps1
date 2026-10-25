@@ -3,7 +3,19 @@ Set-Location $PSScriptRoot
 
 $Version = (Get-Content .\VERSION -Raw).Trim()
 if (-not $Version) { throw 'VERSION is empty.' }
+
+# Refuse to build when release metadata disagrees. This prevents a new source
+# build from silently producing an installer labelled with an older version.
+$AppVersionMatch = Select-String -Path .\app.py -Pattern "^VERSION='([^']+)'" | Select-Object -First 1
+if (-not $AppVersionMatch -or $AppVersionMatch.Matches[0].Groups[1].Value -ne $Version) {
+    throw "Version mismatch: VERSION says $Version but app.py does not."
+}
+$IssVersionMatch = Select-String -Path .\installer\EVEJumpPlanner.iss -Pattern '#define MyAppVersion "([^"]+)"' | Select-Object -First 1
+if (-not $IssVersionMatch -or $IssVersionMatch.Matches[0].Groups[1].Value -ne $Version) {
+    throw "Version mismatch: VERSION says $Version but installer/EVEJumpPlanner.iss does not."
+}
 Write-Host "Building New Eden Command v$Version" -ForegroundColor Cyan
+Write-Host "Expected installer: releases\New_Eden_Command_Setup_v$Version.exe" -ForegroundColor DarkGray
 
 function Test-Python313Executable([string]$Path, [string[]]$PrefixArgs = @()) {
     if (-not $Path) { return $null }
